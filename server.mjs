@@ -7,11 +7,22 @@ const MAX_USERS = Number(process.env.MAX_USERS || 5);
 const NAME = process.env.INSTANCE_NAME || "Ollama #1";
 const GATE = process.env.GATE_TOKEN || "";
 const OLLAMA = (process.env.OLLAMA_BASE || "http://127.0.0.1:11434").replace(/\/$/, "");
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
+const CLOUD = "https://ollama.com";
+const GLM_MODEL = "glm-5.2";
 const SESSION_MS = 15 * 60 * 1000;
+const GLM_ORIGINS = new Set([
+  "https://chat.useroot.sh",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
+]);
 
 const sessions = new Map();
 let signinProc = null;
 let accountCache = { at: 0, body: null };
+let glmBusy = 0;
 
 function json(res, code, body) {
   const payload = JSON.stringify(body);
@@ -21,6 +32,63 @@ function json(res, code, body) {
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
+}
+
+function glmCors(req, res) {
+  const origin = req.headers.origin || "";
+  if (!GLM_ORIGINS.has(origin)) return false;
+  res.setHeader("access-control-allow-origin", origin);
+  res.setHeader("vary", "Origin");
+  res.setHeader("access-control-allow-headers", "content-type, x-wallet");
+  res.setHeader("access-control-allow-methods", "POST, OPTIONS");
+  return true;
+}
+
+function walletHeader(req) {
+  const value = String(req.headers["x-wallet"] || "");
+  return /^0x[a-fA-F0-9]{40}$/.test(value) ? value : "";
+}
+
+function glmMessages(body) {
+  if (!Array.isArray(body?.messages) || body.messages.length === 0) return null;
+  const messages = [];
+  for (const item of body.messages.slice(-32)) {
+    const role = item?.role === "assistant" ? "assistant" : item?.role === "user" ? "user" : "";
+    const content = String(item?.content || "").trim().slice(0, 12000);
+    if (!role || !content) continue;
+    messages.push({ role, content });
+  }
+  return messages.length ? messages : null;
+}
+
+async function askGlm(messages) {
+  const response = await fetch(CLOUD + "/api/chat", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer " + OLLAMA_API_KEY,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model: GLM_MODEL, messages, stream: false }),
+  });
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = {};
+  }
+  if (!response.ok) {
+    const error = new Error(payload.error || "GLM 5.2 cloud did not answer.");
+    error.status = response.status;
+    throw error;
+  }
+  const answer = String(payload.message?.content || "").trim();
+  if (!answer) {
+    const error = new Error("GLM 5.2 cloud returned an empty answer.");
+    error.status = 502;
+    throw error;
+  }
+  return answer;
 }
 
 function authorized(req) {
@@ -206,6 +274,43 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(page);
+      return;
+    }
+    if (url.pathname === "/v1/glm" && (req.method === "OPTIONS" || req.method === "POST")) {
+      const allowed = glmCors(req, res);
+      if (req.method === "OPTIONS") {
+        res.writeHead(allowed ? 204 : 403);
+        res.end();
+        return;
+      }
+      if (!allowed) {
+        json(res, 403, { error: "This chat is only available from the Root harness." });
+        return;
+      }
+      if (!walletHeader(req)) {
+        json(res, 401, { error: "Connect a wallet first." });
+        return;
+      }
+      if (!OLLAMA_API_KEY) {
+        json(res, 503, { error: "GLM 5.2 cloud is not configured." });
+        return;
+      }
+      const messages = glmMessages(await readBody(req));
+      if (!messages) {
+        json(res, 400, { error: "messages is required." });
+        return;
+      }
+      if (glmBusy >= MAX_USERS) {
+        json(res, 429, { error: NAME + " is already serving " + MAX_USERS + " users." });
+        return;
+      }
+      glmBusy += 1;
+      try {
+        const answer = await askGlm(messages);
+        json(res, 200, { model: "glm-5.2:cloud", text: answer });
+      } finally {
+        glmBusy -= 1;
+      }
       return;
     }
     if (!authorized(req)) {

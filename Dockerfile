@@ -2,6 +2,9 @@ FROM ollama/ollama:latest
 
 USER root
 
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+  && rm -rf /var/lib/apt/lists/*
+
 ADD https://nodejs.org/dist/v22.21.0/node-v22.21.0-linux-x64.tar.gz /tmp/node.tar.gz
 RUN tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && rm /tmp/node.tar.gz
 

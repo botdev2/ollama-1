@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
+import { appendTurn, deleteConversation, ensureConversation, getConversation, listConversations, priorMessages } from "./chatStore.mjs";
+import { buildSystemPrompt, extractThink, finalizeAnswer, trimMessages } from "./harness.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_USERS = Number(process.env.MAX_USERS || 5);
@@ -40,7 +42,7 @@ function glmCors(req, res) {
   res.setHeader("access-control-allow-origin", origin);
   res.setHeader("vary", "Origin");
   res.setHeader("access-control-allow-headers", "content-type, x-wallet");
-  res.setHeader("access-control-allow-methods", "POST, OPTIONS");
+  res.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
   return true;
 }
 
@@ -264,6 +266,97 @@ const page = `<!doctype html>
 </script>
 `;
 
+async function handleWalletChat(req, res, url) {
+  const path = url.pathname;
+  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn";
+  if (!chatPath) return false;
+  const allowed = glmCors(req, res);
+  if (!allowed) {
+    json(res, 403, { error: "This chat is only available from the Root harness." });
+    return true;
+  }
+  const wallet = walletHeader(req).toLowerCase();
+  if (!wallet) {
+    json(res, 401, { error: "Connect a wallet first." });
+    return true;
+  }
+  if (req.method === "GET" && path === "/v1/conversations") {
+    json(res, 200, { conversations: listConversations(wallet), contextWindow: 8192 });
+    return true;
+  }
+  if (req.method === "GET" && path.startsWith("/v1/conversations/")) {
+    const conversation = getConversation(wallet, decodeURIComponent(path.slice("/v1/conversations/".length)));
+    if (!conversation) {
+      json(res, 404, { error: "That conversation is not on this wallet." });
+      return true;
+    }
+    json(res, 200, { conversation });
+    return true;
+  }
+  if (req.method === "DELETE" && path.startsWith("/v1/conversations/")) {
+    const removed = deleteConversation(wallet, decodeURIComponent(path.slice("/v1/conversations/".length)));
+    json(res, removed ? 200 : 404, removed ? { ok: true } : { error: "That conversation is not on this wallet." });
+    return true;
+  }
+  if (req.method === "POST" && path === "/v1/chat/turn") {
+    if (!OLLAMA_API_KEY) {
+      json(res, 503, { error: "GLM 5.2 cloud is not configured." });
+      return true;
+    }
+    if (glmBusy >= MAX_USERS) {
+      json(res, 429, { error: NAME + " is already serving " + MAX_USERS + " users." });
+      return true;
+    }
+    const body = await readBody(req);
+    const text = String(body.text || "").trim().slice(0, 12000);
+    if (!text) {
+      json(res, 400, { error: "text is required." });
+      return true;
+    }
+    const mode = body.mode === "ask" || body.mode === "plan" ? body.mode : "agent";
+    const title = String(body.title || text).trim().slice(0, 80);
+    const conversationId = ensureConversation(wallet, {
+      conversationId: String(body.conversationId || ""),
+      projectId: String(body.projectId || "project").slice(0, 80),
+      title,
+      mode,
+      model: "glm-5.2:cloud",
+    });
+    if (!conversationId) {
+      json(res, 404, { error: "That conversation is not on this wallet." });
+      return true;
+    }
+    const system = buildSystemPrompt({
+      mode,
+      project: { label: String(body.projectLabel || ""), remote: String(body.projectRemote || "") },
+      brain: body.brain && typeof body.brain === "object" ? body.brain : {},
+      files: String(body.files || ""),
+      autoprompt: body.autoprompt === true,
+    });
+    const history = priorMessages(conversationId).map((item) => ({
+      role: item.role === "assistant" ? "assistant" : "user",
+      content: finalizeAnswer(item.content),
+    })).filter((item) => item.content);
+    history.push({ role: "user", content: text });
+    const packed = trimMessages(system, history);
+    glmBusy += 1;
+    try {
+      const raw = await askGlm(packed.messages.filter((item) => item.role !== "system").length ? packed.messages : [{ role: "user", content: text }]);
+      const think = extractThink(raw);
+      const answer = finalizeAnswer(raw);
+      appendTurn(conversationId, "user", text, "");
+      appendTurn(conversationId, "assistant", answer, think);
+      const conversation = getConversation(wallet, conversationId);
+      json(res, 200, { conversation, think, text: answer, usage: packed.usage, trimmed: packed.trimmed });
+    } finally {
+      glmBusy -= 1;
+    }
+    return true;
+  }
+  json(res, 404, { error: "not found" });
+  return true;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   try {
@@ -276,43 +369,15 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" && (req.method === "OPTIONS" || req.method === "POST")) {
-      const allowed = glmCors(req, res);
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn") {
       if (req.method === "OPTIONS") {
+        const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);
         res.end();
         return;
       }
-      if (!allowed) {
-        json(res, 403, { error: "This chat is only available from the Root harness." });
-        return;
-      }
-      if (!walletHeader(req)) {
-        json(res, 401, { error: "Connect a wallet first." });
-        return;
-      }
-      if (!OLLAMA_API_KEY) {
-        json(res, 503, { error: "GLM 5.2 cloud is not configured." });
-        return;
-      }
-      const messages = glmMessages(await readBody(req));
-      if (!messages) {
-        json(res, 400, { error: "messages is required." });
-        return;
-      }
-      if (glmBusy >= MAX_USERS) {
-        json(res, 429, { error: NAME + " is already serving " + MAX_USERS + " users." });
-        return;
-      }
-      glmBusy += 1;
-      try {
-        const answer = await askGlm(messages);
-        json(res, 200, { model: "glm-5.2:cloud", text: answer });
-      } finally {
-        glmBusy -= 1;
-      }
-      return;
     }
+    if (await handleWalletChat(req, res, url)) return;
     if (!authorized(req)) {
       json(res, 401, { error: "Sign in with the gate token." });
       return;

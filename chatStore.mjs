@@ -37,14 +37,34 @@ function id() {
   return randomBytes(12).toString("hex");
 }
 
+export const MAX_CONVERSATIONS = 10;
+
+function pruneWallet(wallet, protectId = "") {
+  const rows = db.prepare(`
+    SELECT id FROM conversations WHERE wallet = ? ORDER BY updated_at ASC
+  `).all(wallet);
+  let extra = rows.length - MAX_CONVERSATIONS;
+  const dropped = [];
+  for (const row of rows) {
+    if (extra <= 0) break;
+    if (row.id === protectId) continue;
+    deleteConversation(wallet, row.id);
+    dropped.push(row.id);
+    extra -= 1;
+  }
+  return dropped;
+}
+
 export function listConversations(wallet) {
-  return db.prepare(`
+  const dropped = pruneWallet(wallet);
+  const conversations = db.prepare(`
     SELECT id, project_id AS projectId, title, mode, model, updated_at AS updatedAt
     FROM conversations
     WHERE wallet = ?
     ORDER BY updated_at DESC
-    LIMIT 200
-  `).all(wallet);
+    LIMIT ?
+  `).all(wallet, MAX_CONVERSATIONS);
+  return { conversations, dropped, maxConversations: MAX_CONVERSATIONS };
 }
 
 export function getConversation(wallet, conversationId) {
@@ -64,14 +84,14 @@ export function ensureConversation(wallet, { conversationId, projectId, title, m
     const existing = db.prepare("SELECT id FROM conversations WHERE id = ? AND wallet = ?").get(conversationId, wallet);
     if (!existing) return null;
     db.prepare("UPDATE conversations SET mode = ?, model = ?, updated_at = ? WHERE id = ?").run(mode, model, now(), conversationId);
-    return conversationId;
+    return { id: conversationId, dropped: [] };
   }
   const created = id();
   db.prepare(`
     INSERT INTO conversations (id, wallet, project_id, title, mode, model, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(created, wallet, projectId || "project", (title || "New Agent").slice(0, 80), mode, model, now());
-  return created;
+  return { id: created, dropped: pruneWallet(wallet, created) };
 }
 
 export function appendTurn(conversationId, role, text, think = "") {

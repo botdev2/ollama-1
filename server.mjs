@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
-import { appendTurn, deleteConversation, ensureConversation, getConversation, listConversations, priorMessages } from "./chatStore.mjs";
+import { appendTurn, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
 import { buildSystemPrompt, extractThink, finalizeAnswer, trimMessages } from "./harness.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -281,7 +281,13 @@ async function handleWalletChat(req, res, url) {
     return true;
   }
   if (req.method === "GET" && path === "/v1/conversations") {
-    json(res, 200, { conversations: listConversations(wallet), contextWindow: 8192 });
+    const listed = listConversations(wallet);
+    json(res, 200, {
+      conversations: listed.conversations,
+      dropped: listed.dropped,
+      maxConversations: listed.maxConversations,
+      contextWindow: 8192,
+    });
     return true;
   }
   if (req.method === "GET" && path.startsWith("/v1/conversations/")) {
@@ -315,13 +321,15 @@ async function handleWalletChat(req, res, url) {
     }
     const mode = body.mode === "ask" || body.mode === "plan" ? body.mode : "agent";
     const title = String(body.title || text).trim().slice(0, 80);
-    const conversationId = ensureConversation(wallet, {
+    const ensured = ensureConversation(wallet, {
       conversationId: String(body.conversationId || ""),
       projectId: String(body.projectId || "project").slice(0, 80),
       title,
       mode,
       model: "glm-5.2:cloud",
     });
+    const conversationId = ensured?.id || "";
+    const dropped = ensured?.dropped || [];
     if (!conversationId) {
       json(res, 404, { error: "That conversation is not on this wallet." });
       return true;
@@ -347,7 +355,15 @@ async function handleWalletChat(req, res, url) {
       appendTurn(conversationId, "user", text, "");
       appendTurn(conversationId, "assistant", answer, think);
       const conversation = getConversation(wallet, conversationId);
-      json(res, 200, { conversation, think, text: answer, usage: packed.usage, trimmed: packed.trimmed });
+      json(res, 200, {
+        conversation,
+        think,
+        text: answer,
+        usage: packed.usage,
+        trimmed: packed.trimmed,
+        dropped,
+        maxConversations: MAX_CONVERSATIONS,
+      });
     } finally {
       glmBusy -= 1;
     }

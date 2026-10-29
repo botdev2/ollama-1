@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
 import { appendTurn, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
-import { buildSystemPrompt, extractThink, finalizeAnswer, trimMessages } from "./harness.mjs";
+import { chargeCredit, creditSnapshot } from "./credits.mjs";
+import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, trimMessages } from "./harness.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_USERS = Number(process.env.MAX_USERS || 5);
@@ -41,7 +42,7 @@ function glmCors(req, res) {
   if (!GLM_ORIGINS.has(origin)) return false;
   res.setHeader("access-control-allow-origin", origin);
   res.setHeader("vary", "Origin");
-  res.setHeader("access-control-allow-headers", "content-type, x-wallet");
+  res.setHeader("access-control-allow-headers", "content-type, x-wallet, authorization");
   res.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
   return true;
 }
@@ -90,7 +91,43 @@ async function askGlm(messages) {
     error.status = 502;
     throw error;
   }
-  return answer;
+  return {
+    answer,
+    tokens: Number(payload.prompt_eval_count || 0) + Number(payload.eval_count || 0),
+  };
+}
+
+const sessionCache = new Map();
+
+async function verifiedWallet(req) {
+  const header = String(req.headers.authorization || "");
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) return "";
+  const hit = sessionCache.get(token);
+  if (hit && Date.now() - hit.at < 60_000) return hit.address;
+  let response;
+  try {
+    response = await fetch("https://ops.palmaierc.com/api/auth/me", {
+      headers: { authorization: "Bearer " + token },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch {
+    return "";
+  }
+  if (!response.ok) return "";
+  const data = await response.json().catch(() => ({}));
+  const address = String(data.address || "").toLowerCase();
+  if (!/^0x[a-f0-9]{40}$/.test(address)) return "";
+  if (sessionCache.size > 200) sessionCache.clear();
+  sessionCache.set(token, { at: Date.now(), address });
+  return address;
+}
+
+function creditError(credit) {
+  if (!credit || credit.allowance <= 0) {
+    return "GLM credits come from $PALM held or staked. This wallet has none for this 14-day window.";
+  }
+  return "GLM credits for this 14-day window are used up. They reset on " + String(credit.resetsAt).slice(0, 10) + ".";
 }
 
 function authorized(req) {
@@ -268,16 +305,25 @@ const page = `<!doctype html>
 
 async function handleWalletChat(req, res, url) {
   const path = url.pathname;
-  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn";
+  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/credits";
   if (!chatPath) return false;
   const allowed = glmCors(req, res);
   if (!allowed) {
     json(res, 403, { error: "This chat is only available from the Root harness." });
     return true;
   }
-  const wallet = walletHeader(req).toLowerCase();
-  if (!wallet) {
-    json(res, 401, { error: "Connect a wallet first." });
+  const claimed = walletHeader(req).toLowerCase();
+  const wallet = await verifiedWallet(req);
+  if (!wallet || !claimed || wallet !== claimed) {
+    json(res, 401, { error: "Sign in with the connected wallet before using GLM 5.2." });
+    return true;
+  }
+  if (req.method === "GET" && path === "/v1/credits") {
+    try {
+      json(res, 200, { credit: await creditSnapshot(wallet) });
+    } catch (error) {
+      json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
+    }
     return true;
   }
   if (req.method === "GET" && path === "/v1/conversations") {
@@ -347,11 +393,28 @@ async function handleWalletChat(req, res, url) {
     })).filter((item) => item.content);
     history.push({ role: "user", content: text });
     const packed = trimMessages(system, history);
+    let credit;
+    try {
+      credit = await creditSnapshot(wallet);
+    } catch (error) {
+      json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
+      return true;
+    }
+    if (credit.remaining <= 0) {
+      json(res, 402, { error: creditError(credit), credit });
+      return true;
+    }
     glmBusy += 1;
     try {
-      const raw = await askGlm(packed.messages.filter((item) => item.role !== "system").length ? packed.messages : [{ role: "user", content: text }]);
+      const result = await askGlm(packed.messages.filter((item) => item.role !== "system").length ? packed.messages : [{ role: "user", content: text }]);
+      const raw = result.answer;
       const think = extractThink(raw);
       const answer = finalizeAnswer(raw);
+      const spent = result.tokens > 0
+        ? result.tokens
+        : packed.messages.reduce((sum, item) => sum + estimateTokens(item.content), 0) + estimateTokens(raw);
+      chargeCredit(wallet, spent);
+      const nextCredit = await creditSnapshot(wallet);
       appendTurn(conversationId, "user", text, "");
       appendTurn(conversationId, "assistant", answer, think);
       const conversation = getConversation(wallet, conversationId);
@@ -360,6 +423,7 @@ async function handleWalletChat(req, res, url) {
         think,
         text: answer,
         usage: packed.usage,
+        credit: nextCredit,
         trimmed: packed.trimmed,
         dropped,
         maxConversations: MAX_CONVERSATIONS,
@@ -385,7 +449,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn") {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn") {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);

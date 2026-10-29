@@ -400,7 +400,7 @@ async function handleWalletChat(req, res, url) {
       json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
       return true;
     }
-    if (credit.remaining <= 0) {
+    if ((credit.remainingTokens ?? credit.remaining) <= 0) {
       json(res, 402, { error: creditError(credit), credit });
       return true;
     }

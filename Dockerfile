@@ -9,7 +9,7 @@ ADD https://nodejs.org/dist/v22.21.0/node-v22.21.0-linux-x64.tar.gz /tmp/node.ta
 RUN tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && rm /tmp/node.tar.gz
 
 WORKDIR /srv
-COPY server.mjs chatStore.mjs harness.mjs start.sh /srv/
+COPY server.mjs chatStore.mjs harness.mjs credits.mjs start.sh /srv/
 RUN sed -i 's/\r$//' /srv/start.sh && chmod +x /srv/start.sh
 
 ENV PORT=3000 \

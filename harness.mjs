@@ -61,9 +61,13 @@ function modeBlock(mode) {
   return [
     "Active chat mode: Agent.",
     "AGENT MODE:",
-    "- You may propose edits, commands, and git steps.",
-    "- This web harness does not run tools. Put proposed file changes in markdown so the user can apply them.",
-    "- Never claim a file was edited, created, or deleted.",
+    "The harness runs tools when the reply ends with one or more ```ops fences and no text after the last fence.",
+    "Tools: list_repos, list_files, read_file {path}, search_files {query}, write_file {path, content}, edit_file {path, find, replace}, delete_file {path}, create_repo {name, about}, run_command {command, cwd}, git_status, git_diff, git_log, git_branch.",
+    "run_command is bash inside the open repository. npm install, npm run build, and node script.js work. A command stops after two minutes and a server is not left running.",
+    "write_file commits the full file. edit_file commits the first exact replacement. A wallet can keep 3 repositories.",
+    "After creating or editing files, run setup such as npm install yourself. Do not tell the user to run a command unless it failed.",
+    "After tools run you receive [ops-result]. Emit more fences if more work is required. Otherwise answer in prose and do not emit a fence.",
+    "Never claim a file changed or a command succeeded unless an ops-result says ok.",
   ].join("\n");
 }
 

@@ -11,7 +11,8 @@ const SEL = {
   balanceOf: "0x70a08231",
 };
 const WHOLE = 10n ** 9n;
-const TOKENS_PER_PALM = 2000n;
+const PALM_PER_CREDIT = 1000n;
+const TOKENS_PER_CREDIT = 2_000_000n;
 const PERIOD_MS = 14 * 24 * 60 * 60 * 1000;
 const EPOCH = Date.UTC(2026, 0, 5);
 const MAX_PALM = 10_000_000n * WHOLE;
@@ -32,8 +33,12 @@ db.exec(`
 
 const chainCache = new Map();
 
-export function tokensPerPalm() {
-  return Number(TOKENS_PER_PALM);
+export function palmPerCredit() {
+  return Number(PALM_PER_CREDIT);
+}
+
+export function tokensPerCredit() {
+  return Number(TOKENS_PER_CREDIT);
 }
 
 export function periodInfo(now = Date.now()) {
@@ -68,6 +73,10 @@ function palmText(raw) {
   return whole.toString() + "." + frac;
 }
 
+function asCredits(tokens) {
+  return Number(tokens) / Number(TOKENS_PER_CREDIT);
+}
+
 async function readChain(address) {
   const key = address.toLowerCase();
   const hit = chainCache.get(key);
@@ -99,16 +108,21 @@ export async function creditSnapshot(address) {
   const period = periodInfo();
   const chain = await readChain(wallet);
   const counted = chain.held + chain.staked > MAX_PALM ? MAX_PALM : chain.held + chain.staked;
-  const allowance = Number((counted * TOKENS_PER_PALM) / WHOLE);
+  const allowanceTokens = Number((counted * TOKENS_PER_CREDIT) / (PALM_PER_CREDIT * WHOLE));
   const used = usedTokens(wallet, period.index);
+  const remainingTokens = Math.max(0, allowanceTokens - used);
   return {
     held: palmText(chain.held),
     staked: palmText(chain.staked),
-    allowance,
-    used,
-    remaining: Math.max(0, allowance - used),
+    allowanceTokens,
+    usedTokens: used,
+    remainingTokens,
+    allowance: asCredits(allowanceTokens),
+    used: asCredits(used),
+    remaining: asCredits(remainingTokens),
     resetsAt: new Date(period.resetsAt).toISOString(),
-    tokensPerPalm: Number(TOKENS_PER_PALM),
+    palmPerCredit: Number(PALM_PER_CREDIT),
+    tokensPerCredit: Number(TOKENS_PER_CREDIT),
   };
 }
 

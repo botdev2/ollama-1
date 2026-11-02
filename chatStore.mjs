@@ -28,6 +28,17 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS turns_conversation ON turns (conversation_id, id);
 `);
+try {
+  db.exec("ALTER TABLE conversations ADD COLUMN archived_at TEXT");
+} catch {
+  /* the column is already there */
+}
+
+function shown(row) {
+  if (!row) return row;
+  const { archivedAt, ...rest } = row;
+  return { ...rest, archived: Boolean(archivedAt) };
+}
 
 function now() {
   return new Date().toISOString();
@@ -58,31 +69,39 @@ function pruneWallet(wallet, protectId = "") {
 export function listConversations(wallet) {
   const dropped = pruneWallet(wallet);
   const conversations = db.prepare(`
-    SELECT id, project_id AS projectId, title, mode, model, updated_at AS updatedAt
+    SELECT id, project_id AS projectId, title, mode, model, updated_at AS updatedAt, archived_at AS archivedAt
     FROM conversations
     WHERE wallet = ?
     ORDER BY updated_at DESC
     LIMIT ?
-  `).all(wallet, MAX_CONVERSATIONS);
+  `).all(wallet, MAX_CONVERSATIONS).map(shown);
   return { conversations, dropped, maxConversations: MAX_CONVERSATIONS };
 }
 
 export function getConversation(wallet, conversationId) {
   const row = db.prepare(`
-    SELECT id, project_id AS projectId, title, mode, model, updated_at AS updatedAt
+    SELECT id, project_id AS projectId, title, mode, model, updated_at AS updatedAt, archived_at AS archivedAt
     FROM conversations WHERE id = ? AND wallet = ?
   `).get(conversationId, wallet);
   if (!row) return null;
   const turns = db.prepare(`
     SELECT role, text, think FROM turns WHERE conversation_id = ? ORDER BY id ASC
   `).all(conversationId);
-  return { ...row, turns };
+  return { ...shown(row), turns };
+}
+
+export function archiveConversation(wallet, conversationId) {
+  const row = db.prepare("SELECT id FROM conversations WHERE id = ? AND wallet = ?").get(conversationId, wallet);
+  if (!row) return false;
+  db.prepare("UPDATE conversations SET archived_at = COALESCE(archived_at, ?) WHERE id = ?").run(now(), conversationId);
+  return true;
 }
 
 export function ensureConversation(wallet, { conversationId, projectId, title, mode, model }) {
   if (conversationId) {
-    const existing = db.prepare("SELECT id FROM conversations WHERE id = ? AND wallet = ?").get(conversationId, wallet);
+    const existing = db.prepare("SELECT id, archived_at AS archivedAt FROM conversations WHERE id = ? AND wallet = ?").get(conversationId, wallet);
     if (!existing) return null;
+    if (existing.archivedAt) return { id: conversationId, archived: true, dropped: [] };
     db.prepare("UPDATE conversations SET mode = ?, model = ?, updated_at = ? WHERE id = ?").run(mode, model, now(), conversationId);
     return { id: conversationId, dropped: [] };
   }

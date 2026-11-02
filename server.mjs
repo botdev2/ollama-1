@@ -307,7 +307,7 @@ const page = `<!doctype html>
 
 async function handleWalletChat(req, res, url) {
   const path = url.pathname;
-  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/credits";
+  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/credits";
   if (!chatPath) return false;
   const allowed = glmCors(req, res);
   if (!allowed) {
@@ -356,6 +356,60 @@ async function handleWalletChat(req, res, url) {
     const target = decodeURIComponent(path.slice("/v1/conversations/".length, -"/archive".length));
     const archived = archiveConversation(wallet, target);
     json(res, archived ? 200 : 404, archived ? { ok: true, archived: true } : { error: "That conversation is not on this wallet." });
+    return true;
+  }
+  if (req.method === "POST" && path === "/v1/autoprompt") {
+    if (!OLLAMA_API_KEY) {
+      json(res, 503, { error: "Hamrin 1.0 is not configured." });
+      return true;
+    }
+    const body = await readBody(req);
+    const ask = String(body.text || "").trim().slice(0, 6000);
+    if (!ask) {
+      json(res, 400, { error: "text is required." });
+      return true;
+    }
+    let credit;
+    try {
+      credit = await creditSnapshot(wallet);
+    } catch (error) {
+      json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
+      return true;
+    }
+    if ((credit.remainingTokens ?? credit.remaining) <= 0) {
+      json(res, 402, { error: creditError(credit), credit });
+      return true;
+    }
+    if (glmBusy >= MAX_USERS) {
+      json(res, 429, { error: NAME + " is already serving " + MAX_USERS + " users." });
+      return true;
+    }
+    glmBusy += 1;
+    try {
+      const mode = body.mode === "ask" || body.mode === "plan" ? body.mode : "agent";
+      const label = String(body.projectLabel || "").slice(0, 80);
+      const system = [
+        "You are the Auto-Prompt stage of Hamrin 1.0, inside /root.",
+        "Rewrite the user's loose request into a short, precise brief that another model will act on.",
+        "Output only the brief, as plain text, 2 to 5 short lines. No preamble, no markdown headings, no code fences, no <think> block.",
+        "Cover: the goal, the concrete deliverable, and any constraint the user stated or clearly implied.",
+        "Do not invent requirements, file names, or technologies the user did not mention. If the request is already clear, tighten it and stop.",
+        "Never answer the request and never use tools.",
+        "Chat mode: " + mode + "." + (label ? " Project: " + label + "." : ""),
+      ].join("\n");
+      const result = await askGlm([
+        { role: "system", content: system },
+        { role: "user", content: ask },
+      ]);
+      const brief = finalizeAnswer(result.answer).replace(/```[a-z]*\n?/gi, "").trim().slice(0, 1200);
+      const spent = result.tokens > 0 ? result.tokens : estimateTokens(system) + estimateTokens(ask) + estimateTokens(result.answer);
+      chargeCredit(wallet, spent, credit.windowAllowanceTokens);
+      json(res, 200, { brief, credit: await creditSnapshot(wallet) });
+    } catch (error) {
+      json(res, error.status || 502, { error: error.message || "Auto-Prompt could not write a brief." });
+    } finally {
+      glmBusy -= 1;
+    }
     return true;
   }
   if (req.method === "POST" && path === "/v1/chat/turn") {
@@ -463,7 +517,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn") {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt") {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);

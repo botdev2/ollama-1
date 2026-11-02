@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
-import { appendTurn, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
+import { appendTurn, archiveConversation, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
 import { chargeCredit, creditSnapshot } from "./credits.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, trimMessages } from "./harness.mjs";
 
@@ -123,9 +123,11 @@ async function verifiedWallet(req) {
   return address;
 }
 
+const CONTEXT_FULL_PERCENT = 85;
+
 function creditError(credit) {
-  if (!credit || credit.allowance <= 0) {
-    return "GLM credits come from $PALM held or staked. This wallet has none for this 14-day window.";
+  if (!credit || credit.windowAllowanceTokens <= 0) {
+    return "The 0.5 welcome credits are used up. More credits come from $PALM held or staked: 1,000 $PALM = 1 credit per 14-day window.";
   }
   return "GLM credits for this 14-day window are used up. They reset on " + String(credit.resetsAt).slice(0, 10) + ".";
 }
@@ -350,6 +352,12 @@ async function handleWalletChat(req, res, url) {
     json(res, removed ? 200 : 404, removed ? { ok: true } : { error: "That conversation is not on this wallet." });
     return true;
   }
+  if (req.method === "POST" && path.startsWith("/v1/conversations/") && path.endsWith("/archive")) {
+    const target = decodeURIComponent(path.slice("/v1/conversations/".length, -"/archive".length));
+    const archived = archiveConversation(wallet, target);
+    json(res, archived ? 200 : 404, archived ? { ok: true, archived: true } : { error: "That conversation is not on this wallet." });
+    return true;
+  }
   if (req.method === "POST" && path === "/v1/chat/turn") {
     if (!OLLAMA_API_KEY) {
       json(res, 503, { error: "GLM 5.2 cloud is not configured." });
@@ -378,6 +386,10 @@ async function handleWalletChat(req, res, url) {
     const dropped = ensured?.dropped || [];
     if (!conversationId) {
       json(res, 404, { error: "That conversation is not on this wallet." });
+      return true;
+    }
+    if (ensured?.archived) {
+      json(res, 409, { error: "This chat is archived. Its context was full, so it no longer accepts messages. Start a new chat.", archived: true });
       return true;
     }
     const system = buildSystemPrompt({
@@ -413,16 +425,18 @@ async function handleWalletChat(req, res, url) {
       const spent = result.tokens > 0
         ? result.tokens
         : packed.messages.reduce((sum, item) => sum + estimateTokens(item.content), 0) + estimateTokens(raw);
-      chargeCredit(wallet, spent);
+      chargeCredit(wallet, spent, credit.windowAllowanceTokens);
       const nextCredit = await creditSnapshot(wallet);
       appendTurn(conversationId, "user", text, "");
       appendTurn(conversationId, "assistant", answer, think);
       const conversation = getConversation(wallet, conversationId);
+      const filled = Math.min(100, Math.round(((packed.usage.total + estimateTokens(raw)) / packed.usage.window) * 100));
       json(res, 200, {
         conversation,
         think,
         text: answer,
-        usage: packed.usage,
+        usage: { ...packed.usage, percent: Math.max(packed.usage.percent, filled) },
+        contextFull: packed.trimmed || filled >= CONTEXT_FULL_PERCENT,
         credit: nextCredit,
         trimmed: packed.trimmed,
         dropped,

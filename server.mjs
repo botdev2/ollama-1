@@ -12,7 +12,7 @@ const GATE = process.env.GATE_TOKEN || "";
 const OLLAMA = (process.env.OLLAMA_BASE || "http://127.0.0.1:11434").replace(/\/$/, "");
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
 const CLOUD = "https://ollama.com";
-const GLM_MODEL = "glm-5.2";
+const GLM_MODEL = "glm-5.3";
 const SESSION_MS = 15 * 60 * 1000;
 const GLM_ORIGINS = new Set([
   "https://chat.useroot.sh",
@@ -81,13 +81,13 @@ async function askGlm(messages) {
     payload = {};
   }
   if (!response.ok) {
-    const error = new Error(payload.error || "GLM 5.2 cloud did not answer.");
+    const error = new Error(payload.error || "Hamrin 1.0 did not answer.");
     error.status = response.status;
     throw error;
   }
   const answer = String(payload.message?.content || "").trim();
   if (!answer) {
-    const error = new Error("GLM 5.2 cloud returned an empty answer.");
+    const error = new Error("Hamrin 1.0 returned an empty answer.");
     error.status = 502;
     throw error;
   }
@@ -129,7 +129,7 @@ function creditError(credit) {
   if (!credit || credit.windowAllowanceTokens <= 0) {
     return "The 0.5 welcome credits are used up. More credits come from $PALM held or staked: 1,000 $PALM = 1 credit per 14-day window.";
   }
-  return "GLM credits for this 14-day window are used up. They reset on " + String(credit.resetsAt).slice(0, 10) + ".";
+  return "Hamrin credits for this 14-day window are used up. They reset on " + String(credit.resetsAt).slice(0, 10) + ".";
 }
 
 function authorized(req) {
@@ -317,7 +317,7 @@ async function handleWalletChat(req, res, url) {
   const claimed = walletHeader(req).toLowerCase();
   const wallet = await verifiedWallet(req);
   if (!wallet || !claimed || wallet !== claimed) {
-    json(res, 401, { error: "Sign in with the connected wallet before using GLM 5.2." });
+    json(res, 401, { error: "Sign in with the connected wallet before using Hamrin 1.0." });
     return true;
   }
   if (req.method === "GET" && path === "/v1/credits") {
@@ -360,7 +360,7 @@ async function handleWalletChat(req, res, url) {
   }
   if (req.method === "POST" && path === "/v1/chat/turn") {
     if (!OLLAMA_API_KEY) {
-      json(res, 503, { error: "GLM 5.2 cloud is not configured." });
+      json(res, 503, { error: "Hamrin 1.0 is not configured." });
       return true;
     }
     if (glmBusy >= MAX_USERS) {
@@ -380,7 +380,7 @@ async function handleWalletChat(req, res, url) {
       projectId: String(body.projectId || "project").slice(0, 80),
       title,
       mode,
-      model: "glm-5.2:cloud",
+      model: "hamrin-1.0",
     });
     const conversationId = ensured?.id || "";
     const dropped = ensured?.dropped || [];

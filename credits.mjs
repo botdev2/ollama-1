@@ -29,7 +29,17 @@ db.exec(`
     tokens INTEGER NOT NULL,
     PRIMARY KEY (wallet, period)
   );
+  CREATE TABLE IF NOT EXISTS glm_welcome (
+    wallet TEXT PRIMARY KEY,
+    granted INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    granted_at TEXT NOT NULL
+  );
 `);
+
+// Every wallet is issued half a credit once, the first time it is seen here.
+// It does not reset. It is spent only after the wallet's own window credits run out.
+const WELCOME_TOKENS = Number(TOKENS_PER_CREDIT / 2n);
 
 const chainCache = new Map();
 
@@ -103,13 +113,24 @@ function usedTokens(wallet, period) {
   return row ? Number(row.tokens) || 0 : 0;
 }
 
+function welcomeRow(wallet) {
+  db.prepare("INSERT OR IGNORE INTO glm_welcome (wallet, granted, used, granted_at) VALUES (?, ?, 0, ?)")
+    .run(wallet, WELCOME_TOKENS, new Date().toISOString());
+  const row = db.prepare("SELECT granted, used, granted_at AS grantedAt FROM glm_welcome WHERE wallet = ?").get(wallet);
+  const granted = Number(row.granted) || 0;
+  return { granted, used: Math.min(granted, Number(row.used) || 0), grantedAt: row.grantedAt };
+}
+
 export async function creditSnapshot(address) {
   const wallet = String(address || "").toLowerCase();
   const period = periodInfo();
   const chain = await readChain(wallet);
   const counted = chain.held + chain.staked > MAX_PALM ? MAX_PALM : chain.held + chain.staked;
-  const allowanceTokens = Number((counted * TOKENS_PER_CREDIT) / (PALM_PER_CREDIT * WHOLE));
-  const used = usedTokens(wallet, period.index);
+  const windowAllowanceTokens = Number((counted * TOKENS_PER_CREDIT) / (PALM_PER_CREDIT * WHOLE));
+  const windowUsedTokens = Math.min(usedTokens(wallet, period.index), windowAllowanceTokens);
+  const welcome = welcomeRow(wallet);
+  const allowanceTokens = windowAllowanceTokens + welcome.granted;
+  const used = windowUsedTokens + welcome.used;
   const remainingTokens = Math.max(0, allowanceTokens - used);
   return {
     held: palmText(chain.held),
@@ -120,19 +141,42 @@ export async function creditSnapshot(address) {
     allowance: asCredits(allowanceTokens),
     used: asCredits(used),
     remaining: asCredits(remainingTokens),
+    windowAllowanceTokens,
+    windowAllowance: asCredits(windowAllowanceTokens),
+    windowUsed: asCredits(windowUsedTokens),
+    windowRemaining: asCredits(windowAllowanceTokens - windowUsedTokens),
+    welcome: {
+      credits: asCredits(welcome.granted),
+      used: asCredits(welcome.used),
+      remaining: asCredits(welcome.granted - welcome.used),
+      grantedAt: welcome.grantedAt,
+    },
+    startsAt: new Date(period.startsAt).toISOString(),
     resetsAt: new Date(period.resetsAt).toISOString(),
     palmPerCredit: Number(PALM_PER_CREDIT),
     tokensPerCredit: Number(TOKENS_PER_CREDIT),
   };
 }
 
-export function chargeCredit(address, tokens) {
+// Window credits are spent first. Only the overflow touches the one-time welcome balance.
+export function chargeCredit(address, tokens, windowAllowanceTokens) {
   const wallet = String(address || "").toLowerCase();
   const amount = Math.max(1, Math.floor(Number(tokens) || 0));
   const period = periodInfo().index;
-  db.prepare(`
-    INSERT INTO glm_credits (wallet, period, tokens) VALUES (?, ?, ?)
-    ON CONFLICT (wallet, period) DO UPDATE SET tokens = tokens + excluded.tokens
-  `).run(wallet, period, amount);
+  let toWindow = amount;
+  if (Number.isFinite(windowAllowanceTokens)) {
+    toWindow = Math.min(amount, Math.max(0, windowAllowanceTokens - usedTokens(wallet, period)));
+  }
+  const toWelcome = amount - toWindow;
+  if (toWindow > 0) {
+    db.prepare(`
+      INSERT INTO glm_credits (wallet, period, tokens) VALUES (?, ?, ?)
+      ON CONFLICT (wallet, period) DO UPDATE SET tokens = tokens + excluded.tokens
+    `).run(wallet, period, toWindow);
+  }
+  if (toWelcome > 0) {
+    welcomeRow(wallet);
+    db.prepare("UPDATE glm_welcome SET used = used + ? WHERE wallet = ?").run(toWelcome, wallet);
+  }
   return usedTokens(wallet, period);
 }

@@ -4,6 +4,7 @@ import http from "node:http";
 import { appendTurn, archiveConversation, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
 import { chargeCredit, creditSnapshot } from "./credits.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, trimMessages } from "./harness.mjs";
+import { webFetch, webSearch } from "./web.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_USERS = Number(process.env.MAX_USERS || 5);
@@ -305,9 +306,23 @@ const page = `<!doctype html>
 </script>
 `;
 
+const webHits = new Map();
+
+function webAllowed(wallet) {
+  const now = Date.now();
+  const recent = (webHits.get(wallet) || []).filter((at) => now - at < 60_000);
+  if (recent.length >= 40) {
+    webHits.set(wallet, recent);
+    return false;
+  }
+  recent.push(now);
+  webHits.set(wallet, recent);
+  return true;
+}
+
 async function handleWalletChat(req, res, url) {
   const path = url.pathname;
-  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/credits";
+  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/web/search" || path === "/v1/web/fetch" || path === "/v1/credits";
   if (!chatPath) return false;
   const allowed = glmCors(req, res);
   if (!allowed) {
@@ -356,6 +371,23 @@ async function handleWalletChat(req, res, url) {
     const target = decodeURIComponent(path.slice("/v1/conversations/".length, -"/archive".length));
     const archived = archiveConversation(wallet, target);
     json(res, archived ? 200 : 404, archived ? { ok: true, archived: true } : { error: "That conversation is not on this wallet." });
+    return true;
+  }
+  if (req.method === "POST" && (path === "/v1/web/search" || path === "/v1/web/fetch")) {
+    if (!webAllowed(wallet)) {
+      json(res, 429, { error: "Slow down a little: too many web lookups this minute." });
+      return true;
+    }
+    const body = await readBody(req);
+    try {
+      if (path === "/v1/web/search") {
+        json(res, 200, await webSearch(body.query));
+      } else {
+        json(res, 200, await webFetch(body.url, body.offset));
+      }
+    } catch (error) {
+      json(res, 200, { error: error.message || "That lookup failed." });
+    }
     return true;
   }
   if (req.method === "POST" && path === "/v1/autoprompt") {
@@ -452,6 +484,7 @@ async function handleWalletChat(req, res, url) {
       brain: body.brain && typeof body.brain === "object" ? body.brain : {},
       files: String(body.files || ""),
       autoprompt: body.autoprompt === true,
+      web: body.web === true,
     });
     const history = priorMessages(conversationId).map((item) => ({
       role: item.role === "assistant" ? "assistant" : "user",
@@ -517,7 +550,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt") {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch") {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);

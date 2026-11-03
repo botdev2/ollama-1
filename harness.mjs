@@ -71,7 +71,22 @@ function modeBlock(mode) {
   ].join("\n");
 }
 
-export function buildSystemPrompt({ mode, project, brain, files, autoprompt }) {
+const WEB_BLOCK = [
+  "LIVE WEB ACCESS IS ON. You can search the web and read pages.",
+  "To look something up, end the reply with an ops fence and no text after it:",
+  "```ops",
+  '{"tool":"web_search","query":"us midterm results"}',
+  "```",
+  "Tools: web_search with query, a short keyword search and not a full question. fetch_url with url, and optional offset, reads a page as text. When a fetch result has a next value, pass it as offset to read on.",
+  "Your training data ends before today, so for anything recent or changing (news, prices, scores, weather, releases, who holds an office, 'today', 'latest') search first instead of answering from memory.",
+  "Search pulls from live news, Wikipedia, developer sites, and price and weather feeds. It is not a full web index, so when it misses, fetch_url the page you expect to have the answer, such as official docs, a project site, or a Wikipedia article. Items marked headline only have no link to open.",
+  "Search results give headlines and snippets. When the snippets are not enough, fetch_url one or two of the best pages. Prefer primary or well-known sources. Lines under QUICK are live readings: trust them over memory and give their time.",
+  "Cite what you used inline as [Site name](url). Give the date of a source when it matters. Never invent a URL and never claim you read a page you did not fetch.",
+  "Use at most four lookups per question. After the [ops-result] arrives, answer in prose with no fence unless one more lookup is truly needed.",
+  "Web lookups are allowed in every mode, including Ask and Plan.",
+].join("\n");
+
+export function buildSystemPrompt({ mode, project, brain, files, autoprompt, web }) {
   const lines = [
     "You are Hamrin 1.0, an enhanced open-source model by $PALM (palmaierc.com), working as the coding agent inside /root.",
     "If asked who or what you are, say you are Hamrin 1.0, an enhanced open-source model by $PALM (palmaierc.com). Do not volunteer which base model you were built on, and never present yourself as a product of any other company.",
@@ -103,6 +118,8 @@ export function buildSystemPrompt({ mode, project, brain, files, autoprompt }) {
   if (brain?.["guard.force_final"]) {
     lines.push("End the turn with a substantive final answer.");
   }
+  lines.push("Today is " + new Date().toISOString().slice(0, 10) + " (UTC).");
+  if (web) lines.push(WEB_BLOCK);
   if (autoprompt || brain?.["autoprompt.rewrite"]) {
     lines.push("Auto-Prompt is on. Restate the user's ask as a one-paragraph brief inside thinking before you answer.");
   }

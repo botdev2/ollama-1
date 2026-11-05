@@ -35,7 +35,33 @@ db.exec(`
     used INTEGER NOT NULL DEFAULT 0,
     granted_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS glm_bonus (
+    wallet TEXT PRIMARY KEY,
+    granted INTEGER NOT NULL DEFAULT 0,
+    used INTEGER NOT NULL DEFAULT 0
+  );
 `);
+
+export function database() {
+  return db;
+}
+
+// Credits earned from daily challenges and achievements. They do not reset and are spent last.
+function bonusRow(wallet) {
+  const row = db.prepare("SELECT granted, used FROM glm_bonus WHERE wallet = ?").get(wallet);
+  const granted = row ? Number(row.granted) || 0 : 0;
+  return { granted, used: Math.min(granted, row ? Number(row.used) || 0 : 0) };
+}
+
+export function grantBonus(address, tokens) {
+  const wallet = String(address || "").toLowerCase();
+  const amount = Math.max(0, Math.floor(Number(tokens) || 0));
+  if (!amount) return;
+  db.prepare(`
+    INSERT INTO glm_bonus (wallet, granted, used) VALUES (?, ?, 0)
+    ON CONFLICT (wallet) DO UPDATE SET granted = granted + excluded.granted
+  `).run(wallet, amount);
+}
 
 // Every wallet is issued half a credit once, the first time it is seen here.
 // It does not reset. It is spent only after the wallet's own window credits run out.
@@ -129,8 +155,9 @@ export async function creditSnapshot(address) {
   const windowAllowanceTokens = Number((counted * TOKENS_PER_CREDIT) / (PALM_PER_CREDIT * WHOLE));
   const windowUsedTokens = Math.min(usedTokens(wallet, period.index), windowAllowanceTokens);
   const welcome = welcomeRow(wallet);
-  const allowanceTokens = windowAllowanceTokens + welcome.granted;
-  const used = windowUsedTokens + welcome.used;
+  const bonus = bonusRow(wallet);
+  const allowanceTokens = windowAllowanceTokens + welcome.granted + bonus.granted;
+  const used = windowUsedTokens + welcome.used + bonus.used;
   const remainingTokens = Math.max(0, allowanceTokens - used);
   return {
     held: palmText(chain.held),
@@ -151,6 +178,11 @@ export async function creditSnapshot(address) {
       remaining: asCredits(welcome.granted - welcome.used),
       grantedAt: welcome.grantedAt,
     },
+    bonus: {
+      credits: asCredits(bonus.granted),
+      used: asCredits(bonus.used),
+      remaining: asCredits(bonus.granted - bonus.used),
+    },
     startsAt: new Date(period.startsAt).toISOString(),
     resetsAt: new Date(period.resetsAt).toISOString(),
     palmPerCredit: Number(PALM_PER_CREDIT),
@@ -167,7 +199,17 @@ export function chargeCredit(address, tokens, windowAllowanceTokens) {
   if (Number.isFinite(windowAllowanceTokens)) {
     toWindow = Math.min(amount, Math.max(0, windowAllowanceTokens - usedTokens(wallet, period)));
   }
-  const toWelcome = amount - toWindow;
+  let rest = amount - toWindow;
+  const welcomeLeft = rest > 0 ? (() => { const w = welcomeRow(wallet); return Math.max(0, w.granted - w.used); })() : 0;
+  let toWelcome = Math.min(rest, welcomeLeft);
+  rest -= toWelcome;
+  const bonus = rest > 0 ? bonusRow(wallet) : { granted: 0, used: 0 };
+  const toBonus = Math.min(rest, Math.max(0, bonus.granted - bonus.used));
+  rest -= toBonus;
+  toWelcome += rest;
+  if (toBonus > 0) {
+    db.prepare("UPDATE glm_bonus SET used = used + ? WHERE wallet = ?").run(toBonus, wallet);
+  }
   if (toWindow > 0) {
     db.prepare(`
       INSERT INTO glm_credits (wallet, period, tokens) VALUES (?, ?, ?)

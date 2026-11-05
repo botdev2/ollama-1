@@ -3,6 +3,7 @@ import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
 import { appendTurn, archiveConversation, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
 import { chargeCredit, creditSnapshot } from "./credits.mjs";
+import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
 import { webFetch, webSearch } from "./web.mjs";
 
@@ -128,7 +129,7 @@ const CONTEXT_FULL_PERCENT = 85;
 
 function creditError(credit) {
   if (!credit || credit.windowAllowanceTokens <= 0) {
-    return "The 0.5 welcome credits are used up. More credits come from $PALM held or staked: 1,000 $PALM = 1 credit per 14-day window.";
+    return "The 0.5 welcome credits are used up. More credits come from $PALM held or staked (1,000 $PALM = 1 credit per 14-day window) and from daily challenges in Quests.";
   }
   return "Hamrin credits for this 14-day window are used up. They reset on " + String(credit.resetsAt).slice(0, 10) + ".";
 }
@@ -384,7 +385,7 @@ function webAllowed(wallet) {
 
 async function handleWalletChat(req, res, url) {
   const path = url.pathname;
-  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/web/search" || path === "/v1/web/fetch" || path === "/v1/credits";
+  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/web/search" || path === "/v1/web/fetch" || path === "/v1/credits" || path === "/v1/quests" || path.startsWith("/v1/quests/");
   if (!chatPath) return false;
   const allowed = glmCors(req, res);
   if (!allowed) {
@@ -403,6 +404,30 @@ async function handleWalletChat(req, res, url) {
     } catch (error) {
       json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
     }
+    return true;
+  }
+  if (path === "/v1/quests" || path.startsWith("/v1/quests/")) {
+    try {
+      if (req.method === "GET" && path === "/v1/quests") {
+        json(res, 200, { quests: questState(wallet), credit: await creditSnapshot(wallet) });
+        return true;
+      }
+      if (req.method === "POST" && path === "/v1/quests/event") {
+        const body = await readBody(req, 4000);
+        json(res, 200, { ok: true, counted: recordEvent(wallet, body.event) });
+        return true;
+      }
+      if (req.method === "POST" && path === "/v1/quests/claim") {
+        const body = await readBody(req, 4000);
+        const result = claimQuest(wallet, String(body.kind || ""), String(body.id || ""));
+        json(res, 200, { ...result, quests: questState(wallet), credit: await creditSnapshot(wallet) });
+        return true;
+      }
+    } catch (error) {
+      json(res, error.status || 503, { error: error.message || "Quests are unavailable." });
+      return true;
+    }
+    json(res, 404, { error: "not found" });
     return true;
   }
   if (req.method === "GET" && path === "/v1/conversations") {
@@ -442,11 +467,9 @@ async function handleWalletChat(req, res, url) {
     }
     const body = await readBody(req);
     try {
-      if (path === "/v1/web/search") {
-        json(res, 200, await webSearch(body.query));
-      } else {
-        json(res, 200, await webFetch(body.url, body.offset));
-      }
+      const found = path === "/v1/web/search" ? await webSearch(body.query) : await webFetch(body.url, body.offset);
+      if (!found?.error) track(wallet, ["web"]);
+      json(res, 200, found);
     } catch (error) {
       json(res, 200, { error: error.message || "That lookup failed." });
     }
@@ -498,6 +521,7 @@ async function handleWalletChat(req, res, url) {
       const brief = finalizeAnswer(result.answer).replace(/```[a-z]*\n?/gi, "").trim().slice(0, 1200);
       const spent = result.tokens > 0 ? result.tokens : estimateTokens(system) + estimateTokens(ask) + estimateTokens(result.answer);
       chargeCredit(wallet, spent, credit.windowAllowanceTokens);
+      track(wallet, ["autoprompt"]);
       json(res, 200, { brief, credit: await creditSnapshot(wallet) });
     } catch (error) {
       json(res, error.status || 502, { error: error.message || "Auto-Prompt could not write a brief." });
@@ -578,6 +602,7 @@ async function handleWalletChat(req, res, url) {
       const nextCredit = await creditSnapshot(wallet);
       appendTurn(conversationId, "user", text, "");
       appendTurn(conversationId, "assistant", answer, think);
+      track(wallet, ["turn", "turn:" + mode, ...(String(body.conversationId || "") ? [] : ["chat_new"])]);
       const conversation = getConversation(wallet, conversationId);
       const filled = Math.min(100, Math.round(((packed.usage.total + estimateTokens(raw)) / packed.usage.window) * 100));
       json(res, 200, {
@@ -612,7 +637,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch") {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/")) {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);

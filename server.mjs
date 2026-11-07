@@ -383,6 +383,66 @@ function webAllowed(wallet) {
   return true;
 }
 
+const palmIdHits = new Map();
+
+function palmIdAddress(pathname) {
+  const match = String(pathname || "").match(/^\/v1\/palm-id\/(0x[a-fA-F0-9]{40})$/);
+  return match ? match[1].toLowerCase() : "";
+}
+
+function palmIdAllowed(ip) {
+  const now = Date.now();
+  const key = ip || "unknown";
+  const recent = (palmIdHits.get(key) || []).filter((at) => now - at < 60_000);
+  if (recent.length >= 30) {
+    palmIdHits.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  palmIdHits.set(key, recent);
+  return true;
+}
+
+async function handlePalmId(req, res, url) {
+  const address = palmIdAddress(url.pathname);
+  if (!address) return false;
+  const allowed = glmCors(req, res);
+  if (!allowed) {
+    json(res, 403, { error: "This ID is only available from the Root harness." });
+    return true;
+  }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+  if (req.method !== "GET") {
+    json(res, 405, { error: "GET only." });
+    return true;
+  }
+  const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
+  if (!palmIdAllowed(ip)) {
+    json(res, 429, { error: "Too many ID lookups. Wait a minute." });
+    return true;
+  }
+  try {
+    const credit = await creditSnapshot(address);
+    const quests = questState(address);
+    json(res, 200, {
+      address,
+      held: credit.held,
+      staked: credit.staked,
+      windowAllowance: credit.windowAllowance,
+      palmPerCredit: credit.palmPerCredit,
+      points: quests.points,
+      creditsEarned: quests.creditsEarned,
+    });
+  } catch (error) {
+    json(res, error.status || 503, { error: error.message || "Could not read this PALM ID." });
+  }
+  return true;
+}
+
 async function handleWalletChat(req, res, url) {
   const path = url.pathname;
   const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/web/search" || path === "/v1/web/fetch" || path === "/v1/credits" || path === "/v1/quests" || path.startsWith("/v1/quests/");
@@ -637,7 +697,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/")) {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname.startsWith("/v1/palm-id/")) {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);
@@ -674,6 +734,7 @@ const server = http.createServer(async (req, res) => {
       }
       return;
     }
+    if (await handlePalmId(req, res, url)) return;
     if (await handleWalletChat(req, res, url)) return;
     if (!authorized(req)) {
       json(res, 401, { error: "Sign in with the gate token." });

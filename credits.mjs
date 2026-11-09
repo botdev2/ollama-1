@@ -148,21 +148,66 @@ function welcomeRow(wallet) {
 }
 
 const TRANSFER_CACHE = new Map();
-const TRANSFER_TTL = 5 * 60 * 1000;
-const MONTH_SEC = 30 * 24 * 60 * 60;
+const TRANSFER_TTL = 10 * 60 * 1000;
+const WINDOW_SEC = 180 * 24 * 60 * 60;
+const PAGE = 100;
+const PAGES = 8;
+const PACKED = 200;
+
+const VENUES = new Map([
+  [STAKING.toLowerCase(), { venue: "Staking" }],
+  ["0xf82f5da00779687931609452b7a765a6391fe84a", { venue: "Distributor" }],
+  ["0x051ef36e55875c08e4efaea6072c6d0f66fb0b9f", { venue: "Uniswap", dex: true }],
+  ["0x7a250d5630b4cf539739df2c5dacb4c659f2488d", { venue: "Uniswap", dex: true }],
+  ["0xe592427a0aece92de3edee1f18e0157c05861564", { venue: "Uniswap", dex: true }],
+  ["0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45", { venue: "Uniswap", dex: true }],
+  ["0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", { venue: "Uniswap", dex: true }],
+  ["0x66a9893cc07d91d95644aedd05d03f95e1dba8af", { venue: "Uniswap", dex: true }],
+  ["0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b", { venue: "Uniswap", dex: true }],
+  ["0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f", { venue: "Sushi", dex: true }],
+  ["0x1111111254eeb25477b68fb85ed929f73a960582", { venue: "1inch", dex: true }],
+  ["0x111111125421ca6dc452d289314280a0f8842a65", { venue: "1inch", dex: true }],
+  ["0x1111111254fb6c44bac0bed2854e76f90643097d", { venue: "1inch", dex: true }],
+  ["0xdef1c0ded9bec7f1a1670819833240f027b25eff", { venue: "0x", dex: true }],
+  ["0x6131b5fae19ea4f9d964eac0408e4408b66337b5", { venue: "Kyber", dex: true }],
+  ["0x6352a56caadc4f1e25cd6c75970fa768a3304e64", { venue: "OpenOcean", dex: true }],
+]);
+
+const SWAP_SEL = new Set([
+  "022c0d9f",
+  "128acb08",
+  "7ff36ab5",
+  "18cbafe5",
+  "38ed1739",
+  "fb3bdb41",
+  "4a25d94a",
+  "8803dbee",
+  "5c11d795",
+  "b6f9de95",
+  "791ac947",
+  "414bf389",
+  "db3e2198",
+  "04e45aaf",
+  "c04b8d59",
+  "3593564c",
+  "24856bc3",
+  "12aa3caf",
+  "5023b4df",
+  "bce0b010",
+  "09b81346",
+  "42712a67",
+  "472b43f3",
+  "f28c0498",
+  "5ae401dc",
+]);
+
+let venuesAt = 0;
+let venues = new Map(VENUES);
 
 function shortWallet(value) {
   const text = String(value || "");
   if (!/^0x[a-fA-F0-9]{40}$/.test(text)) return text;
   return text.slice(0, 6) + "…" + text.slice(-4);
-}
-
-function txKind(from, to, wallet) {
-  const staking = STAKING.toLowerCase();
-  if (to === staking) return "stake";
-  if (from === staking) return "unstake";
-  if (to === wallet) return "in";
-  return "out";
 }
 
 function tokenAmount(value, decimals) {
@@ -181,16 +226,63 @@ function tokenAmount(value, decimals) {
   }
 }
 
-async function etherscanTokenTx(wallet) {
+function selectorOf(row) {
+  const input = String(row.input || row.methodId || "");
+  const match = input.match(/^0x([0-9a-fA-F]{8})/);
+  if (match) return match[1].toLowerCase();
+  const name = String(row.functionName || "").toLowerCase();
+  if (name.includes("swap")) return "swap";
+  return "";
+}
+
+function classify(from, to, wallet, row, book) {
+  const staking = STAKING.toLowerCase();
+  if (to === staking) return { kind: "stake", venue: "Staking", party: to };
+  if (from === staking) return { kind: "unstake", venue: "Staking", party: from };
+  const other = to === wallet ? from : to;
+  const hit = book.get(other);
+  const sel = selectorOf(row);
+  const swapped = Boolean(hit?.dex) || SWAP_SEL.has(sel) || sel === "swap";
+  if (swapped) {
+    return { kind: to === wallet ? "buy" : "sell", venue: hit?.venue || "Swap", party: other };
+  }
+  return { kind: to === wallet ? "in" : "out", venue: hit?.venue || "", party: other };
+}
+
+async function loadVenues() {
+  if (venuesAt && Date.now() - venuesAt < 30 * 60 * 1000) return venues;
+  try {
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${PALM}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    const body = await response.json();
+    const next = new Map(VENUES);
+    for (const pair of body.pairs || []) {
+      if (String(pair.chainId) !== "ethereum") continue;
+      const addr = String(pair.pairAddress || "").toLowerCase();
+      if (!/^0x[0-9a-f]{40}$/.test(addr)) continue;
+      const dex = String(pair.dexId || "swap");
+      const venue = dex === "uniswap" ? "Uniswap" : dex.charAt(0).toUpperCase() + dex.slice(1);
+      next.set(addr, { venue, dex: true });
+    }
+    venues = next;
+    venuesAt = Date.now();
+  } catch {
+    venuesAt = Date.now();
+  }
+  return venues;
+}
+
+async function etherscanTokenTx(wallet, page) {
   const key = process.env.ETHERSCAN_API_KEY ? `&apikey=${process.env.ETHERSCAN_API_KEY}` : "";
-  const query = `module=account&action=tokentx&contractaddress=${PALM}&address=${wallet}&page=1&offset=80&sort=desc`;
+  const query = `module=account&action=tokentx&contractaddress=${PALM}&address=${wallet}&page=${page}&offset=${PAGE}&sort=desc`;
   const urls = [
     `https://eth.blockscout.com/api?${query}`,
     ...(key ? [`https://api.etherscan.io/v2/api?chainid=1&${query}${key}`] : []),
   ];
   for (const url of urls) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
       const body = await response.json();
       if (Array.isArray(body.result)) return body.result;
     } catch {
@@ -200,35 +292,52 @@ async function etherscanTokenTx(wallet) {
   return null;
 }
 
-/** $PALM transfers for this wallet in the last 30 days. Public, cached. */
+async function readPalmTransfers(wallet) {
+  const since = Math.floor(Date.now() / 1000) - WINDOW_SEC;
+  const rows = [];
+  const seen = new Set();
+  for (let page = 1; page <= PAGES; page += 1) {
+    const batch = await etherscanTokenTx(wallet, page);
+    if (!batch) return page === 1 ? null : rows;
+    if (!batch.length) break;
+    let oldest = Infinity;
+    for (const row of batch) {
+      const id = `${row.hash}:${row.from}:${row.to}:${row.value}:${row.timeStamp}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const at = Number(row.timeStamp) || 0;
+      if (at && at < oldest) oldest = at;
+      if (at >= since) rows.push(row);
+    }
+    if (oldest < since || batch.length < PAGE) break;
+  }
+  return rows;
+}
+
+/** $PALM transfers, swaps, and stake moves for this wallet in the last six months. */
 export async function palmMonthTxs(address) {
   const wallet = String(address || "").toLowerCase();
   const hit = TRANSFER_CACHE.get(wallet);
   if (hit && Date.now() - hit.at < TRANSFER_TTL) return hit.txs;
-  const rows = await etherscanTokenTx(wallet);
+  const [book, rows] = await Promise.all([loadVenues(), readPalmTransfers(wallet)]);
   if (!rows) return hit?.txs || [];
-  const since = Math.floor(Date.now() / 1000) - MONTH_SEC;
   const txs = [];
   for (const row of rows) {
-    const at = Number(row.timeStamp) || 0;
-    if (at < since) continue;
     const from = String(row.from || "").toLowerCase();
     const to = String(row.to || "").toLowerCase();
     const amount = tokenAmount(row.value, row.tokenDecimal);
     if (!amount) continue;
-    const kind = txKind(from, to, wallet);
+    const item = classify(from, to, wallet, row, book);
     txs.push({
       hash: row.hash,
-      at: at * 1000,
-      kind,
+      at: (Number(row.timeStamp) || 0) * 1000,
+      kind: item.kind,
       amount,
-      counterparty: kind === "in" || kind === "unstake" ? from : to,
+      venue: item.venue,
+      counterparty: item.venue || shortWallet(item.party),
     });
   }
-  const packed = txs.slice(0, 40).map((item) => ({
-    ...item,
-    counterparty: shortWallet(item.counterparty),
-  }));
+  const packed = txs.slice(0, PACKED);
   TRANSFER_CACHE.set(wallet, { at: Date.now(), txs: packed });
   return packed;
 }

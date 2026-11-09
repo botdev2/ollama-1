@@ -3,6 +3,7 @@ import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
 import { appendTurn, archiveConversation, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
 import { chargeCredit, creditSnapshot, palmMonthTxs } from "./credits.mjs";
+import { otpCheck, otpNow } from "./palmOtp.mjs";
 import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
 import { webFetch, webSearch } from "./web.mjs";
@@ -384,28 +385,35 @@ function webAllowed(wallet) {
 }
 
 const palmIdHits = new Map();
+const palmOtpHits = new Map();
+const palmVerifyHits = new Map();
 
-function palmIdAddress(pathname) {
-  const match = String(pathname || "").match(/^\/v1\/palm-id\/(0x[a-fA-F0-9]{40})$/);
-  return match ? match[1].toLowerCase() : "";
+function palmIdRoute(pathname) {
+  const match = String(pathname || "").match(/^\/v1\/palm-id\/(0x[a-fA-F0-9]{40})(?:\/(otp)(?:\/(verify))?)?$/);
+  if (!match) return null;
+  return { address: match[1].toLowerCase(), otp: match[2] === "otp", verify: match[3] === "verify" };
 }
 
-function palmIdAllowed(ip) {
+function palmIdAllowed(store, ip, cap) {
   const now = Date.now();
   const key = ip || "unknown";
-  const recent = (palmIdHits.get(key) || []).filter((at) => now - at < 60_000);
-  if (recent.length >= 30) {
-    palmIdHits.set(key, recent);
+  const recent = (store.get(key) || []).filter((at) => now - at < 60_000);
+  if (recent.length >= cap) {
+    store.set(key, recent);
     return false;
   }
   recent.push(now);
-  palmIdHits.set(key, recent);
+  store.set(key, recent);
   return true;
 }
 
+function palmIdIp(req) {
+  return String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
+}
+
 async function handlePalmId(req, res, url) {
-  const address = palmIdAddress(url.pathname);
-  if (!address) return false;
+  const route = palmIdRoute(url.pathname);
+  if (!route) return false;
   const allowed = glmCors(req, res);
   if (!allowed) {
     json(res, 403, { error: "This ID is only available from the Root harness." });
@@ -416,16 +424,47 @@ async function handlePalmId(req, res, url) {
     res.end();
     return true;
   }
+  const ip = palmIdIp(req);
+  if (route.verify) {
+    if (req.method !== "POST") {
+      json(res, 405, { error: "POST only." });
+      return true;
+    }
+    if (!palmIdAllowed(palmVerifyHits, ip, 30)) {
+      json(res, 429, { error: "Too many seal checks. Wait a minute." });
+      return true;
+    }
+    try {
+      const body = await readBody(req, 4000);
+      const ok = otpCheck(route.address, body.code);
+      json(res, 200, { ok, address: route.address });
+    } catch (error) {
+      json(res, error.status || 400, { error: error.message || "Could not check that seal." });
+    }
+    return true;
+  }
+  if (route.otp) {
+    if (req.method !== "GET") {
+      json(res, 405, { error: "GET only." });
+      return true;
+    }
+    if (!palmIdAllowed(palmOtpHits, ip, 90)) {
+      json(res, 429, { error: "Too many seal lookups. Wait a minute." });
+      return true;
+    }
+    json(res, 200, { address: route.address, ...otpNow(route.address) });
+    return true;
+  }
   if (req.method !== "GET") {
     json(res, 405, { error: "GET only." });
     return true;
   }
-  const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
-  if (!palmIdAllowed(ip)) {
+  if (!palmIdAllowed(palmIdHits, ip, 30)) {
     json(res, 429, { error: "Too many ID lookups. Wait a minute." });
     return true;
   }
   try {
+    const address = route.address;
     const [credit, quests, txs] = await Promise.all([
       creditSnapshot(address),
       Promise.resolve(questState(address)),

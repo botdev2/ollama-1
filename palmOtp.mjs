@@ -1,10 +1,47 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-export const OTP_PERIOD = 20;
+export const OTP_PERIOD = 30;
 export const OTP_DIGITS = 6;
 
-function secret() {
+function master() {
   return process.env.PALM_ID_OTP_SECRET || process.env.GATE_TOKEN || "palm-id-otp-dev";
+}
+
+function otpKey(address) {
+  return createHmac("sha256", master())
+    .update("palm-id-totp:" + String(address || "").toLowerCase())
+    .digest()
+    .subarray(0, 20);
+}
+
+function toBase32(bytes) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += alphabet[(value << (5 - bits)) & 31];
+  return out;
+}
+
+export function otpSecret(address) {
+  return toBase32(otpKey(address));
+}
+
+export function otpAuth(address) {
+  const wallet = String(address || "").toLowerCase();
+  const short = wallet.slice(0, 6) + "..." + wallet.slice(-4);
+  const label = encodeURIComponent("PALM ID:" + short);
+  const issuer = encodeURIComponent("PALM ID");
+  const secret = otpSecret(wallet);
+  return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=${OTP_DIGITS}&period=${OTP_PERIOD}`;
 }
 
 export function otpStep(now = Date.now()) {
@@ -12,9 +49,10 @@ export function otpStep(now = Date.now()) {
 }
 
 export function otpCode(address, step) {
-  const mac = createHmac("sha256", secret())
-    .update("palm-id:" + String(address || "").toLowerCase() + ":" + String(step))
-    .digest();
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(Math.floor(step / 0x100000000), 0);
+  buf.writeUInt32BE(step >>> 0, 4);
+  const mac = createHmac("sha1", otpKey(address)).update(buf).digest();
   const offset = mac[mac.length - 1] & 0x0f;
   const bin =
     ((mac[offset] & 0x7f) << 24) |
@@ -26,13 +64,17 @@ export function otpCode(address, step) {
 }
 
 export function otpNow(address, now = Date.now()) {
+  const wallet = String(address || "").toLowerCase();
   const step = otpStep(now);
   const remaining = OTP_PERIOD - (Math.floor(now / 1000) % OTP_PERIOD);
   return {
-    code: otpCode(address, step),
+    code: otpCode(wallet, step),
     remaining: remaining === 0 ? OTP_PERIOD : remaining,
     period: OTP_PERIOD,
     digits: OTP_DIGITS,
+    algorithm: "SHA1",
+    secret: otpSecret(wallet),
+    otpauth: otpAuth(wallet),
   };
 }
 

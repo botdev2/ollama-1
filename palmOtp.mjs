@@ -38,10 +38,10 @@ export function otpSecret(address) {
 export function otpAuth(address) {
   const wallet = String(address || "").toLowerCase();
   const short = wallet.slice(0, 6) + "..." + wallet.slice(-4);
-  const label = encodeURIComponent("PALM ID:" + short);
   const issuer = encodeURIComponent("PALM ID");
+  const account = encodeURIComponent(short);
   const secret = otpSecret(wallet);
-  return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=${OTP_DIGITS}&period=${OTP_PERIOD}`;
+  return `otpauth://totp/${issuer}:${account}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=${OTP_DIGITS}&period=${OTP_PERIOD}`;
 }
 
 export function otpStep(now = Date.now()) {

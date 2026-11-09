@@ -147,6 +147,92 @@ function welcomeRow(wallet) {
   return { granted, used: Math.min(granted, Number(row.used) || 0), grantedAt: row.grantedAt };
 }
 
+const TRANSFER_CACHE = new Map();
+const TRANSFER_TTL = 5 * 60 * 1000;
+const MONTH_SEC = 30 * 24 * 60 * 60;
+
+function shortWallet(value) {
+  const text = String(value || "");
+  if (!/^0x[a-fA-F0-9]{40}$/.test(text)) return text;
+  return text.slice(0, 6) + "…" + text.slice(-4);
+}
+
+function txKind(from, to, wallet) {
+  const staking = STAKING.toLowerCase();
+  if (to === staking) return "stake";
+  if (from === staking) return "unstake";
+  if (to === wallet) return "in";
+  return "out";
+}
+
+function tokenAmount(value, decimals) {
+  try {
+    const raw = BigInt(value || "0");
+    const places = Math.min(18, Math.max(0, Number(decimals) || 9));
+    const whole = 10n ** BigInt(places);
+    const abs = raw < 0n ? -raw : raw;
+    const head = abs / whole;
+    const frac = abs % whole;
+    const cents = Number((frac * 100n) / whole);
+    const amount = Number(head) + cents / 100;
+    return raw < 0n ? -amount : amount;
+  } catch {
+    return 0;
+  }
+}
+
+async function etherscanTokenTx(wallet) {
+  const key = process.env.ETHERSCAN_API_KEY ? `&apikey=${process.env.ETHERSCAN_API_KEY}` : "";
+  const query = `module=account&action=tokentx&contractaddress=${PALM}&address=${wallet}&page=1&offset=80&sort=desc`;
+  const urls = [
+    `https://eth.blockscout.com/api?${query}`,
+    ...(key ? [`https://api.etherscan.io/v2/api?chainid=1&${query}${key}`] : []),
+  ];
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const body = await response.json();
+      if (Array.isArray(body.result)) return body.result;
+    } catch {
+      /* try the next host */
+    }
+  }
+  return null;
+}
+
+/** $PALM transfers for this wallet in the last 30 days. Public, cached. */
+export async function palmMonthTxs(address) {
+  const wallet = String(address || "").toLowerCase();
+  const hit = TRANSFER_CACHE.get(wallet);
+  if (hit && Date.now() - hit.at < TRANSFER_TTL) return hit.txs;
+  const rows = await etherscanTokenTx(wallet);
+  if (!rows) return hit?.txs || [];
+  const since = Math.floor(Date.now() / 1000) - MONTH_SEC;
+  const txs = [];
+  for (const row of rows) {
+    const at = Number(row.timeStamp) || 0;
+    if (at < since) continue;
+    const from = String(row.from || "").toLowerCase();
+    const to = String(row.to || "").toLowerCase();
+    const amount = tokenAmount(row.value, row.tokenDecimal);
+    if (!amount) continue;
+    const kind = txKind(from, to, wallet);
+    txs.push({
+      hash: row.hash,
+      at: at * 1000,
+      kind,
+      amount,
+      counterparty: kind === "in" || kind === "unstake" ? from : to,
+    });
+  }
+  const packed = txs.slice(0, 40).map((item) => ({
+    ...item,
+    counterparty: shortWallet(item.counterparty),
+  }));
+  TRANSFER_CACHE.set(wallet, { at: Date.now(), txs: packed });
+  return packed;
+}
+
 export async function creditSnapshot(address) {
   const wallet = String(address || "").toLowerCase();
   const period = periodInfo();

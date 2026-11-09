@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import http from "node:http";
 import { appendTurn, archiveConversation, deleteConversation, ensureConversation, getConversation, listConversations, MAX_CONVERSATIONS, priorMessages } from "./chatStore.mjs";
-import { chargeCredit, creditSnapshot } from "./credits.mjs";
+import { chargeCredit, creditSnapshot, palmMonthTxs } from "./credits.mjs";
 import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
 import { webFetch, webSearch } from "./web.mjs";
@@ -426,8 +426,11 @@ async function handlePalmId(req, res, url) {
     return true;
   }
   try {
-    const credit = await creditSnapshot(address);
-    const quests = questState(address);
+    const [credit, quests, txs] = await Promise.all([
+      creditSnapshot(address),
+      Promise.resolve(questState(address)),
+      palmMonthTxs(address).catch(() => []),
+    ]);
     json(res, 200, {
       address,
       held: credit.held,
@@ -436,6 +439,7 @@ async function handlePalmId(req, res, url) {
       palmPerCredit: credit.palmPerCredit,
       points: quests.points,
       creditsEarned: quests.creditsEarned,
+      txs,
     });
   } catch (error) {
     json(res, error.status || 503, { error: error.message || "Could not read this PALM ID." });

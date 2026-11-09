@@ -448,8 +448,13 @@ async function handlePalmId(req, res, url) {
       json(res, 405, { error: "GET only." });
       return true;
     }
-    if (!palmIdAllowed(palmOtpHits, ip, 90)) {
+    if (!palmIdAllowed(palmOtpHits, ip, 30)) {
       json(res, 429, { error: "Too many seal lookups. Wait a minute." });
+      return true;
+    }
+    const owner = await verifiedWallet(req);
+    if (owner !== route.address) {
+      json(res, 401, { error: "Only the signed-in owner of this wallet can open the authenticator." });
       return true;
     }
     json(res, 200, { address: route.address, ...otpNow(route.address) });

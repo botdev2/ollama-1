@@ -46,13 +46,18 @@ function harvest() {
     "SELECT DISTINCT lower(wallet) AS wallet FROM quest_activity",
     "SELECT DISTINCT lower(wallet) AS wallet FROM quest_claims",
   ];
-  const upsert = db.prepare(`
-    INSERT INTO root_users (id, kind, first_seen, last_seen, live_until)
-    VALUES (?, 'wallet', ?, ?, ?)
-    ON CONFLICT (id) DO UPDATE SET
-      kind = 'wallet',
-      last_seen = excluded.last_seen
-  `);
+  let upsert;
+  try {
+    upsert = db.prepare(`
+      INSERT INTO root_users (id, kind, first_seen, last_seen, live_until)
+      VALUES (?, 'wallet', ?, ?, ?)
+      ON CONFLICT (id) DO UPDATE SET
+        kind = 'wallet',
+        last_seen = excluded.last_seen
+    `);
+  } catch {
+    return;
+  }
   for (const sql of sources) {
     let rows = [];
     try {
@@ -63,7 +68,11 @@ function harvest() {
     for (const row of rows) {
       const wallet = String(row.wallet || "").toLowerCase();
       if (!WALLET.test(wallet)) continue;
-      upsert.run(wallet, seen, seen, dead);
+      try {
+        upsert.run(wallet, seen, seen, dead);
+      } catch {
+        /* skip a bad row */
+      }
     }
   }
 }
@@ -101,4 +110,8 @@ export function parseAnonId(value) {
   return ANON.test(id) ? id : "";
 }
 
-harvest();
+try {
+  harvest();
+} catch {
+  harvestedAt = 0;
+}

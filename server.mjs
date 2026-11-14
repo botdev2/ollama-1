@@ -5,6 +5,7 @@ import { appendTurn, archiveConversation, deleteConversation, ensureConversation
 import { chargeCredit, creditSnapshot, palmMonthTxs } from "./credits.mjs";
 import { otpCheck, otpNow } from "./palmOtp.mjs";
 import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
+import { parseAnonId, touchUser, userStats } from "./rootUsers.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
 import { webFetch, webSearch } from "./web.mjs";
 
@@ -411,6 +412,55 @@ function palmIdIp(req) {
   return String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
 }
 
+const presenceHits = new Map();
+
+async function handleUserStats(req, res, url) {
+  const path = url.pathname;
+  if (path !== "/v1/stats/users" && path !== "/v1/presence") return false;
+  const allowed = glmCors(req, res);
+  if (!allowed) {
+    json(res, 403, { error: "This chat is only available from the Root harness." });
+    return true;
+  }
+  if (path === "/v1/stats/users") {
+    if (req.method !== "GET") {
+      json(res, 405, { error: "GET only." });
+      return true;
+    }
+    json(res, 200, userStats());
+    return true;
+  }
+  if (req.method !== "POST") {
+    json(res, 405, { error: "POST only." });
+    return true;
+  }
+  if (!palmIdAllowed(presenceHits, palmIdIp(req), 12)) {
+    json(res, 429, { error: "Too many presence pings." });
+    return true;
+  }
+  const wallet = await verifiedWallet(req);
+  const claimed = walletHeader(req).toLowerCase();
+  if (wallet && claimed && wallet === claimed) {
+    touchUser(wallet, "wallet");
+    json(res, 200, { ok: true, ...userStats() });
+    return true;
+  }
+  let body = {};
+  try {
+    body = await readBody(req, 400);
+  } catch {
+    body = {};
+  }
+  const anon = parseAnonId(body.session);
+  if (!anon) {
+    json(res, 400, { error: "Connect a wallet or send a session id." });
+    return true;
+  }
+  touchUser(anon, "anon");
+  json(res, 200, { ok: true, ...userStats() });
+  return true;
+}
+
 async function handlePalmId(req, res, url) {
   const route = palmIdRoute(url.pathname);
   if (!route) return false;
@@ -745,7 +795,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname.startsWith("/v1/palm-id/")) {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname.startsWith("/v1/palm-id/") || url.pathname === "/v1/stats/users" || url.pathname === "/v1/presence") {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);
@@ -783,6 +833,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (await handlePalmId(req, res, url)) return;
+    if (await handleUserStats(req, res, url)) return;
     if (await handleWalletChat(req, res, url)) return;
     if (!authorized(req)) {
       json(res, 401, { error: "Sign in with the gate token." });

@@ -11,3 +11,7 @@ The Ollama daemon and the processing server run in the same container. Sign in o
 `POST /v1/signin` starts `ollama signin` and returns the URL to approve with your Ollama user. Open `/` in a browser for the same actions.
 
 `GET /health` is unauthenticated so the platform can probe the process. It does not show whether anyone is signed in.
+
+## Root users
+
+`root_users` is a dedicated table in `root-chat.sqlite`. On boot (and every few minutes) it harvests distinct wallets from conversations, credits, and quests. `GET /v1/stats/users` returns `{ live, users }` with no wallet list. `POST /v1/presence` from chat.useroot.sh heartbeats a signed-in wallet or an anonymous session for the live counter.

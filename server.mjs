@@ -506,6 +506,7 @@ async function handleAvatar(req, res, url) {
       companionSystem({ view, projectLabel, wallet, ...work }),
       "The person did not ask you anything. Offer one unsolicited, specific piece of advice about the open chat or repo.",
       "Comment on the actual work: the last ask, the files, the build, the copy, the commit. Do not invent blindness.",
+      "You may emit a ```guide fence to click Files or open a view. Never set send:true on an unsolicited nudge.",
       "Do not greet. Do not say you are checking in. Do not mention that this is unsolicited.",
       "If you have nothing useful and specific, reply with exactly NO.",
     ].join("\n");

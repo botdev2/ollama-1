@@ -5,6 +5,7 @@ import { appendTurn, archiveConversation, deleteConversation, ensureConversation
 import { chargeCredit, creditSnapshot, palmMonthTxs } from "./credits.mjs";
 import { otpCheck, otpNow } from "./palmOtp.mjs";
 import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
+import { companionSystem, noteAdvice, noteSaid, noteSeen, recall, spokenBit } from "./avatarMemory.mjs";
 import { parseAnonId, touchUser, userStats } from "./rootUsers.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
 import { webFetch, webSearch } from "./web.mjs";
@@ -413,6 +414,130 @@ function palmIdIp(req) {
 }
 
 const presenceHits = new Map();
+const avatarHits = new Map();
+const avatarNudges = new Map();
+
+function usableAdvice(text) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  if (!value || value.length < 12) return "";
+  if (/^no\.?$/i.test(value)) return "";
+  if (/\b(nothing useful|no advice|cannot help|i don't know)\b/i.test(value)) return "";
+  return value.slice(0, 400);
+}
+
+function avatarNudgeOk(wallet) {
+  const now = Date.now();
+  const recent = (avatarNudges.get(wallet) || []).filter((at) => now - at < 60 * 60 * 1000);
+  if (recent.length && now - recent[recent.length - 1] < 35_000) {
+    avatarNudges.set(wallet, recent);
+    return false;
+  }
+  if (recent.length >= 6) {
+    avatarNudges.set(wallet, recent);
+    return false;
+  }
+  recent.push(now);
+  avatarNudges.set(wallet, recent);
+  return true;
+}
+
+async function handleAvatar(req, res, url) {
+  const path = url.pathname;
+  if (path !== "/v1/avatar/watch" && path !== "/v1/avatar/memory") return false;
+  const allowed = glmCors(req, res);
+  if (!allowed) {
+    json(res, 403, { error: "This chat is only available from the Root harness." });
+    return true;
+  }
+  const claimed = walletHeader(req).toLowerCase();
+  const wallet = await verifiedWallet(req);
+  if (!wallet || !claimed || wallet !== claimed) {
+    json(res, 401, { error: "Sign in with the connected wallet before using Hamrin 1.0." });
+    return true;
+  }
+  if (path === "/v1/avatar/memory") {
+    if (req.method !== "GET") {
+      json(res, 405, { error: "GET only." });
+      return true;
+    }
+    json(res, 200, { memory: recall(wallet) });
+    return true;
+  }
+  if (req.method !== "POST") {
+    json(res, 405, { error: "POST only." });
+    return true;
+  }
+  if (!palmIdAllowed(avatarHits, wallet, 20)) {
+    json(res, 429, { error: "Slow down a little." });
+    return true;
+  }
+  const body = await readBody(req, 4000);
+  const view = String(body.view || "home").slice(0, 40);
+  const projectLabel = String(body.projectLabel || "").slice(0, 80);
+  const said = spokenBit(body.said || "");
+  noteSeen(wallet, view, projectLabel);
+  if (said) noteSaid(wallet, said);
+  const memory = recall(wallet);
+  const wantNudge = body.nudge !== false;
+  if (!wantNudge) {
+    json(res, 200, { memory, advice: null });
+    return true;
+  }
+  if (!OLLAMA_API_KEY || glmBusy >= MAX_USERS || !avatarNudgeOk(wallet)) {
+    json(res, 200, { memory, advice: null });
+    return true;
+  }
+  let credit;
+  try {
+    credit = await creditSnapshot(wallet);
+  } catch (error) {
+    json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
+    return true;
+  }
+  if ((credit.remainingTokens ?? credit.remaining) <= 0) {
+    json(res, 200, { memory, advice: null, credit });
+    return true;
+  }
+  glmBusy += 1;
+  try {
+    const system = [
+      companionSystem({ view, projectLabel, wallet }),
+      "The person did not ask you anything. Offer one unsolicited, specific piece of advice or a useful nudge.",
+      "Do not greet. Do not say you are checking in. Do not mention that this is unsolicited.",
+      "If you have nothing useful and specific, reply with exactly NO.",
+    ].join("\n");
+    const result = await askGlm([
+      { role: "system", content: system },
+      { role: "user", content: "What would you say to them right now?" },
+    ]);
+    const advice = usableAdvice(finalizeAnswer(result.answer));
+    if (!advice) {
+      json(res, 200, { memory, advice: null, credit });
+      return true;
+    }
+    const spent = result.tokens > 0 ? result.tokens : estimateTokens(system) + estimateTokens(result.answer);
+    chargeCredit(wallet, spent, credit.windowAllowanceTokens);
+    noteAdvice(wallet, advice);
+    const conversationId = String(body.conversationId || "");
+    if (conversationId) {
+      const ensured = ensureConversation(wallet, {
+        conversationId,
+        projectId: "__avatar__",
+        title: "Avatar",
+        mode: "ask",
+        model: "hamrin-1.0",
+      });
+      if (ensured?.id && !ensured.archived) appendTurn(ensured.id, "assistant", advice, "");
+    }
+    track(wallet, ["avatar_nudge"]);
+    json(res, 200, { memory: recall(wallet), advice, credit: await creditSnapshot(wallet) });
+  } catch (error) {
+    json(res, error.status || 502, { error: error.message || "The companion could not speak." });
+  } finally {
+    glmBusy -= 1;
+  }
+  return true;
+}
 
 async function handleUserStats(req, res, url) {
   const path = url.pathname;
@@ -705,9 +830,10 @@ async function handleWalletChat(req, res, url) {
     }
     const mode = body.mode === "ask" || body.mode === "plan" ? body.mode : "agent";
     const title = String(body.title || text).trim().slice(0, 80);
+    const projectId = String(body.projectId || "project").slice(0, 80);
     const ensured = ensureConversation(wallet, {
       conversationId: String(body.conversationId || ""),
-      projectId: String(body.projectId || "project").slice(0, 80),
+      projectId,
       title,
       mode,
       model: "hamrin-1.0",
@@ -722,19 +848,27 @@ async function handleWalletChat(req, res, url) {
       json(res, 409, { error: "This chat is archived. Its context was full, so it no longer accepts messages. Start a new chat.", archived: true });
       return true;
     }
-    const system = buildSystemPrompt({
-      mode,
-      project: { label: String(body.projectLabel || ""), remote: String(body.projectRemote || "") },
-      brain: body.brain && typeof body.brain === "object" ? body.brain : {},
-      files: String(body.files || ""),
-      autoprompt: body.autoprompt === true,
-      web: body.web === true,
-    });
+    const avatar = projectId === "__avatar__";
+    if (avatar) {
+      noteSaid(wallet, text);
+      noteSeen(wallet, body.view, body.projectLabel);
+    }
+    const system = avatar
+      ? companionSystem({ view: body.view, projectLabel: body.projectLabel, wallet })
+      : buildSystemPrompt({
+          mode,
+          project: { label: String(body.projectLabel || ""), remote: String(body.projectRemote || "") },
+          brain: body.brain && typeof body.brain === "object" ? body.brain : {},
+          files: String(body.files || ""),
+          autoprompt: body.autoprompt === true,
+          web: body.web === true,
+        });
     const history = priorMessages(conversationId).map((item) => ({
       role: item.role === "assistant" ? "assistant" : "user",
       content: finalizeAnswer(item.content),
     })).filter((item) => item.content);
-    history.push({ role: "user", content: text });
+    const spoken = avatar ? spokenBit(text) || text : text;
+    history.push({ role: "user", content: spoken });
     const packed = trimMessages(system, history);
     let credit;
     try {
@@ -758,7 +892,7 @@ async function handleWalletChat(req, res, url) {
         : packed.messages.reduce((sum, item) => sum + estimateTokens(item.content), 0) + estimateTokens(raw);
       chargeCredit(wallet, spent, credit.windowAllowanceTokens);
       const nextCredit = await creditSnapshot(wallet);
-      appendTurn(conversationId, "user", text, "");
+      appendTurn(conversationId, "user", spoken, "");
       appendTurn(conversationId, "assistant", answer, think);
       track(wallet, ["turn", "turn:" + mode, ...(String(body.conversationId || "") ? [] : ["chat_new"])]);
       const conversation = getConversation(wallet, conversationId);
@@ -795,7 +929,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname.startsWith("/v1/palm-id/") || url.pathname === "/v1/stats/users" || url.pathname === "/v1/presence") {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname.startsWith("/v1/palm-id/") || url.pathname === "/v1/stats/users" || url.pathname === "/v1/presence" || url.pathname === "/v1/avatar/watch" || url.pathname === "/v1/avatar/memory") {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);
@@ -834,6 +968,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (await handlePalmId(req, res, url)) return;
     if (await handleUserStats(req, res, url)) return;
+    if (await handleAvatar(req, res, url)) return;
     if (await handleWalletChat(req, res, url)) return;
     if (!authorized(req)) {
       json(res, 401, { error: "Sign in with the gate token." });

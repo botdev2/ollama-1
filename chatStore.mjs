@@ -49,11 +49,14 @@ function id() {
 }
 
 export const MAX_CONVERSATIONS = 10;
+const AVATAR_PROJECT = "__avatar__";
 
 function pruneWallet(wallet, protectId = "") {
   const rows = db.prepare(`
-    SELECT id FROM conversations WHERE wallet = ? ORDER BY updated_at ASC
-  `).all(wallet);
+    SELECT id FROM conversations
+    WHERE wallet = ? AND project_id != ?
+    ORDER BY updated_at ASC
+  `).all(wallet, AVATAR_PROJECT);
   let extra = rows.length - MAX_CONVERSATIONS;
   const dropped = [];
   for (const row of rows) {
@@ -71,10 +74,10 @@ export function listConversations(wallet) {
   const conversations = db.prepare(`
     SELECT id, project_id AS projectId, title, mode, model, updated_at AS updatedAt, archived_at AS archivedAt
     FROM conversations
-    WHERE wallet = ?
+    WHERE wallet = ? AND project_id != ?
     ORDER BY updated_at DESC
     LIMIT ?
-  `).all(wallet, MAX_CONVERSATIONS).map(shown);
+  `).all(wallet, AVATAR_PROJECT, MAX_CONVERSATIONS).map(shown);
   return { conversations, dropped, maxConversations: MAX_CONVERSATIONS };
 }
 
@@ -98,19 +101,22 @@ export function archiveConversation(wallet, conversationId) {
 }
 
 export function ensureConversation(wallet, { conversationId, projectId, title, mode, model }) {
+  const avatar = projectId === AVATAR_PROJECT;
   if (conversationId) {
     const existing = db.prepare("SELECT id, archived_at AS archivedAt FROM conversations WHERE id = ? AND wallet = ?").get(conversationId, wallet);
-    if (!existing) return null;
-    if (existing.archivedAt) return { id: conversationId, archived: true, dropped: [] };
-    db.prepare("UPDATE conversations SET mode = ?, model = ?, updated_at = ? WHERE id = ?").run(mode, model, now(), conversationId);
-    return { id: conversationId, dropped: [] };
+    if (existing && !existing.archivedAt) {
+      db.prepare("UPDATE conversations SET mode = ?, model = ?, updated_at = ? WHERE id = ?").run(mode, model, now(), conversationId);
+      return { id: conversationId, dropped: [] };
+    }
+    if (existing?.archivedAt && !avatar) return { id: conversationId, archived: true, dropped: [] };
+    if (!avatar) return null;
   }
   const created = id();
   db.prepare(`
     INSERT INTO conversations (id, wallet, project_id, title, mode, model, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(created, wallet, projectId || "project", (title || "New Agent").slice(0, 80), mode, model, now());
-  return { id: created, dropped: pruneWallet(wallet, created) };
+  return { id: created, dropped: avatar ? [] : pruneWallet(wallet, created) };
 }
 
 export function appendTurn(conversationId, role, text, think = "") {

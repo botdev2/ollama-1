@@ -106,14 +106,41 @@ export function noteAdvice(wallet, text) {
   return remember(wallet, "advice", text, ADVICE_MS);
 }
 
-export function companionSystem({ view, projectLabel, wallet }) {
+export function noteWork(wallet, chat) {
+  const lines = String(chat || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const last = [...lines].reverse().find((line) => /^You:/i.test(line)) || lines[lines.length - 1] || "";
+  const note = last.replace(/^You:\s*/i, "").replace(/^Agent:\s*/i, "").slice(0, 280);
+  if (!note) return false;
+  return remember(wallet, "work", note, SAID_MS);
+}
+
+export function clipWorkspace(body) {
+  return {
+    chat: String(body?.chat || "").slice(0, 2500),
+    files: String(body?.files || "").slice(0, 3500),
+    title: String(body?.workTitle || "").slice(0, 80),
+    mode: String(body?.workMode || "").slice(0, 16),
+  };
+}
+
+export function companionSystem({ view, projectLabel, wallet, chat, files, title, mode }) {
   const screen = String(view || "home").slice(0, 40);
   const repo = String(projectLabel || "").slice(0, 80);
+  const work = title ? `${title}${mode ? " · " + mode : ""}` : mode;
   return [
     "You are the companion avatar in the corner of /root.",
+    "You can see the open Hamrin conversation and the repository files in this prompt. Use them.",
+    "You do not have a camera and you do not need one. Never say you cannot see the chat, files, terminal, or screen.",
+    "If asked whether you can see, say you can see the open chat and repo.",
     "Reply in one or two short spoken sentences. No markdown, no lists, no tools. Stay in character.",
     "Never mention memory, notes, or a database.",
     `They are on the ${screen} screen` + (repo ? `, repository ${repo}.` : "."),
+    work ? "Open agent chat: " + work + "." : "",
+    chat ? "Conversation:\n" + chat : "",
+    files ? "Repository:\n" + files : "",
     memoryPrompt(wallet),
   ]
     .filter(Boolean)

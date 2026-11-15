@@ -5,7 +5,7 @@ import { appendTurn, archiveConversation, deleteConversation, ensureConversation
 import { chargeCredit, creditSnapshot, palmMonthTxs } from "./credits.mjs";
 import { otpCheck, otpNow } from "./palmOtp.mjs";
 import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
-import { companionSystem, noteAdvice, noteSaid, noteSeen, recall, spokenBit } from "./avatarMemory.mjs";
+import { clipWorkspace, companionSystem, noteAdvice, noteSaid, noteSeen, noteWork, recall, spokenBit } from "./avatarMemory.mjs";
 import { parseAnonId, touchUser, userStats } from "./rootUsers.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
 import { webFetch, webSearch } from "./web.mjs";
@@ -471,12 +471,14 @@ async function handleAvatar(req, res, url) {
     json(res, 429, { error: "Slow down a little." });
     return true;
   }
-  const body = await readBody(req, 4000);
+  const body = await readBody(req, 32_000);
   const view = String(body.view || "home").slice(0, 40);
   const projectLabel = String(body.projectLabel || "").slice(0, 80);
   const said = spokenBit(body.said || "");
+  const work = clipWorkspace(body);
   noteSeen(wallet, view, projectLabel);
   if (said) noteSaid(wallet, said);
+  if (work.chat) noteWork(wallet, work.chat);
   const memory = recall(wallet);
   const wantNudge = body.nudge !== false;
   if (!wantNudge) {
@@ -501,8 +503,9 @@ async function handleAvatar(req, res, url) {
   glmBusy += 1;
   try {
     const system = [
-      companionSystem({ view, projectLabel, wallet }),
-      "The person did not ask you anything. Offer one unsolicited, specific piece of advice or a useful nudge.",
+      companionSystem({ view, projectLabel, wallet, ...work }),
+      "The person did not ask you anything. Offer one unsolicited, specific piece of advice about the open chat or repo.",
+      "Comment on the actual work: the last ask, the files, the build, the copy, the commit. Do not invent blindness.",
       "Do not greet. Do not say you are checking in. Do not mention that this is unsolicited.",
       "If you have nothing useful and specific, reply with exactly NO.",
     ].join("\n");
@@ -849,12 +852,14 @@ async function handleWalletChat(req, res, url) {
       return true;
     }
     const avatar = projectId === "__avatar__";
+    const work = avatar ? clipWorkspace(body) : null;
     if (avatar) {
       noteSaid(wallet, text);
       noteSeen(wallet, body.view, body.projectLabel);
+      if (work.chat) noteWork(wallet, work.chat);
     }
     const system = avatar
-      ? companionSystem({ view: body.view, projectLabel: body.projectLabel, wallet })
+      ? companionSystem({ view: body.view, projectLabel: body.projectLabel, wallet, ...work })
       : buildSystemPrompt({
           mode,
           project: { label: String(body.projectLabel || ""), remote: String(body.projectRemote || "") },

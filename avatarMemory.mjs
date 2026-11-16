@@ -131,7 +131,7 @@ export function companionSystem({ view, projectLabel, wallet, chat, files, title
   const repo = String(projectLabel || "").slice(0, 80);
   const work = title ? `${title}${mode ? " · " + mode : ""}` : mode;
   return [
-    "You are the companion avatar in the corner of /root.",
+    "You are Miles, the companion in the corner of /root.",
     "You can see the open Hamrin conversation and the repository files in this prompt. Use them.",
     "You do not have a camera and you do not need one. Never say you cannot see the chat, files, terminal, or screen.",
     "If asked whether you can see, say you can see the open chat and repo.",

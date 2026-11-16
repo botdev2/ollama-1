@@ -527,7 +527,7 @@ async function handleAvatar(req, res, url) {
       const ensured = ensureConversation(wallet, {
         conversationId,
         projectId: "__avatar__",
-        title: "Avatar",
+        title: "Miles",
         mode: "ask",
         model: "hamrin-1.0",
       });

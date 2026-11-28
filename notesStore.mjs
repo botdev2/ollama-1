@@ -22,6 +22,15 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS day_notes_wallet_day ON day_notes (wallet, day);
   CREATE INDEX IF NOT EXISTS day_notes_remind ON day_notes (wallet, miles_remind, remind_at, done);
 `);
+try {
+  db.exec("ALTER TABLE day_notes ADD COLUMN plan TEXT NOT NULL DEFAULT ''");
+} catch {
+  /* the column is already there */
+}
+
+function cleanPlan(value) {
+  return String(value || "").trim().slice(0, 2000);
+}
 
 const PARTS = new Set(["morning", "afternoon", "evening", "night"]);
 
@@ -58,6 +67,7 @@ function shown(row) {
     conversationTitle: row.conversationTitle || "",
     milesRemind: Boolean(row.milesRemind),
     remindAt: row.remindAt || null,
+    plan: row.plan || "",
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -67,7 +77,7 @@ const SELECT = `
   SELECT id, day, text, part, done,
     project_id AS projectId, project_label AS projectLabel,
     conversation_id AS conversationId, conversation_title AS conversationTitle,
-    miles_remind AS milesRemind, remind_at AS remindAt,
+    miles_remind AS milesRemind, remind_at AS remindAt, plan,
     created_at AS createdAt, updated_at AS updatedAt
   FROM day_notes
 `;
@@ -115,12 +125,13 @@ export function createNote(wallet, body = {}) {
   const conversationTitle = String(body.conversationTitle || "").slice(0, 80);
   const milesRemind = body.milesRemind ? 1 : 0;
   const remindAt = body.remindAt ? String(body.remindAt).slice(0, 40) : null;
+  const plan = cleanPlan(body.plan);
   db.prepare(`
     INSERT INTO day_notes (
       id, wallet, day, text, part, done,
       project_id, project_label, conversation_id, conversation_title,
-      miles_remind, remind_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+      miles_remind, remind_at, plan, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     noteId,
     wallet,
@@ -133,6 +144,7 @@ export function createNote(wallet, body = {}) {
     conversationTitle,
     milesRemind,
     remindAt,
+    plan,
     stamp,
     stamp,
   );
@@ -159,12 +171,13 @@ export function updateNote(wallet, noteId, body = {}) {
   const milesRemind = body.milesRemind != null ? (body.milesRemind ? 1 : 0) : row.milesRemind ? 1 : 0;
   let remindAt = row.remindAt || null;
   if (body.remindAt !== undefined) remindAt = body.remindAt ? String(body.remindAt).slice(0, 40) : null;
+  const plan = body.plan != null ? cleanPlan(body.plan) : cleanPlan(row.plan);
   const stamp = now();
   db.prepare(`
     UPDATE day_notes SET
       text = ?, part = ?, done = ?,
       project_id = ?, project_label = ?, conversation_id = ?, conversation_title = ?,
-      miles_remind = ?, remind_at = ?, updated_at = ?
+      miles_remind = ?, remind_at = ?, plan = ?, updated_at = ?
     WHERE id = ? AND wallet = ?
   `).run(
     text,
@@ -176,6 +189,7 @@ export function updateNote(wallet, noteId, body = {}) {
     conversationTitle,
     milesRemind,
     remindAt,
+    plan,
     stamp,
     noteId,
     wallet,
@@ -198,8 +212,8 @@ export function replaceDayNotes(wallet, day, notes) {
     INSERT INTO day_notes (
       id, wallet, day, text, part, done,
       project_id, project_label, conversation_id, conversation_title,
-      miles_remind, remind_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      miles_remind, remind_at, plan, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const stamp = now();
   wipe.run(wallet, key);
@@ -219,6 +233,7 @@ export function replaceDayNotes(wallet, day, notes) {
       String(item.conversationTitle || "").slice(0, 80),
       item.milesRemind ? 1 : 0,
       item.remindAt ? String(item.remindAt).slice(0, 40) : null,
+      cleanPlan(item.plan),
       String(item.createdAt || stamp).slice(0, 40),
       stamp,
     );

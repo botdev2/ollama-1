@@ -33,6 +33,21 @@ let signinProc = null;
 let accountCache = { at: 0, body: null };
 let glmBusy = 0;
 
+function parseNoteSuggestions(text) {
+  const cleaned = String(text || "").replace(/```json|```/gi, "").trim();
+  let list = [];
+  try {
+    const data = JSON.parse(cleaned);
+    list = Array.isArray(data) ? data : data.tasks || data.notes || [];
+  } catch {
+    list = cleaned.split("\n");
+  }
+  return list
+    .map((item) => String(item?.text || item || "").replace(/^[-*\d.)\s]+/, "").trim())
+    .filter((item) => item.length > 2 && item.length < 180)
+    .slice(0, 4);
+}
+
 function json(res, code, body) {
   const payload = JSON.stringify(body);
   res.writeHead(code, {
@@ -740,8 +755,85 @@ async function handleWalletChat(req, res, url) {
         json(res, 200, { notes: listNotes(wallet, day), day: day || new Date().toISOString().slice(0, 10) });
         return true;
       }
+      if (req.method === "POST" && path === "/v1/notes/draft") {
+        if (!OLLAMA_API_KEY) {
+          json(res, 503, { error: "Hamrin 1.0 is not configured." });
+          return true;
+        }
+        const body = await readBody(req, 12000);
+        const kind = body.kind === "suggest" ? "suggest" : "plan";
+        const hint = String(body.text || "").trim().slice(0, 600);
+        const projectLabel = String(body.projectLabel || "").trim().slice(0, 80);
+        const existing = (Array.isArray(body.notes) ? body.notes : [])
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 12);
+        let credit;
+        try {
+          credit = await creditSnapshot(wallet);
+        } catch (error) {
+          json(res, error.status || 503, { error: error.message || "Could not read $PALM for this wallet." });
+          return true;
+        }
+        if ((credit.remainingTokens ?? credit.remaining) <= 0) {
+          json(res, 402, { error: creditError(credit), credit });
+          return true;
+        }
+        if (glmBusy >= MAX_USERS) {
+          json(res, 429, { error: NAME + " is already serving " + MAX_USERS + " users." });
+          return true;
+        }
+        const system =
+          kind === "suggest"
+            ? [
+                "You suggest short day notes for a coding desk.",
+                "Return only a JSON array of 4 strings. Each string is one task, under 90 characters.",
+                "Do not repeat tasks already listed. No markdown, no preamble.",
+              ].join(" ")
+            : [
+                "You write a Plan: concrete instructions another agent will follow to finish one note.",
+                "Plain text, 4 to 8 short lines. Name the deliverable and the checks.",
+                "Use the user's instructions when they gave any. Do not add a title or a code fence.",
+              ].join(" ");
+        const user =
+          kind === "suggest"
+            ? [
+                projectLabel ? "Project: " + projectLabel : "No project selected.",
+                hint ? "Hint: " + hint : "Suggest useful tasks for the rest of today.",
+                existing.length ? "Already noted:\n" + existing.map((item) => "- " + item).join("\n") : "",
+              ]
+                .filter(Boolean)
+                .join("\n\n")
+            : [
+                projectLabel ? "Project: " + projectLabel : "",
+                "Note: " + (hint || "Untitled note"),
+                body.instructions ? "User instructions:\n" + String(body.instructions).slice(0, 1500) : "The user asked you to write the plan.",
+              ]
+                .filter(Boolean)
+                .join("\n\n");
+        glmBusy += 1;
+        try {
+          const result = await askGlm([
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ]);
+          const answer = finalizeAnswer(result.answer).replace(/```[a-z]*\n?/gi, "").trim();
+          const spent = result.tokens > 0 ? result.tokens : estimateTokens(system) + estimateTokens(user) + estimateTokens(answer);
+          chargeCredit(wallet, spent, credit.windowAllowanceTokens);
+          if (kind === "suggest") {
+            json(res, 200, { suggestions: parseNoteSuggestions(answer), credit: await creditSnapshot(wallet) });
+          } else {
+            json(res, 200, { plan: answer.slice(0, 2000), credit: await creditSnapshot(wallet) });
+          }
+        } catch (error) {
+          json(res, error.status || 502, { error: error.message || "Hamrin could not draft that." });
+        } finally {
+          glmBusy -= 1;
+        }
+        return true;
+      }
       if (req.method === "POST" && path === "/v1/notes") {
-        const body = await readBody(req, 8000);
+        const body = await readBody(req, 16000);
         if (body.replace === true && Array.isArray(body.notes)) {
           json(res, 200, { notes: replaceDayNotes(wallet, body.day, body.notes), day: String(body.day || "").slice(0, 10) });
           return true;
@@ -752,7 +844,7 @@ async function handleWalletChat(req, res, url) {
       if (path.startsWith("/v1/notes/") && path.length > "/v1/notes/".length) {
         const noteId = decodeURIComponent(path.slice("/v1/notes/".length));
         if (req.method === "PATCH" || req.method === "POST") {
-          const body = await readBody(req, 8000);
+          const body = await readBody(req, 16000);
           const note = updateNote(wallet, noteId, body);
           if (!note) {
             json(res, 404, { error: "That note is not on this wallet." });

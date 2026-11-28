@@ -5,6 +5,7 @@ import { appendTurn, archiveConversation, deleteConversation, ensureConversation
 import { chargeCredit, creditSnapshot, palmMonthTxs } from "./credits.mjs";
 import { otpCheck, otpNow } from "./palmOtp.mjs";
 import { claimQuest, questState, recordEvent, track } from "./quests.mjs";
+import { createNote, deleteNote, dueMilesNotes, listNotes, replaceDayNotes, updateNote } from "./notesStore.mjs";
 import { clipWorkspace, companionSystem, noteAdvice, noteSaid, noteSeen, noteWork, recall, spokenBit } from "./avatarMemory.mjs";
 import { parseAnonId, touchUser, userStats } from "./rootUsers.mjs";
 import { buildSystemPrompt, estimateTokens, extractThink, finalizeAnswer, stripThink, trimMessages } from "./harness.mjs";
@@ -672,7 +673,18 @@ async function handlePalmId(req, res, url) {
 
 async function handleWalletChat(req, res, url) {
   const path = url.pathname;
-  const chatPath = path === "/v1/conversations" || path.startsWith("/v1/conversations/") || path === "/v1/chat/turn" || path === "/v1/autoprompt" || path === "/v1/web/search" || path === "/v1/web/fetch" || path === "/v1/credits" || path === "/v1/quests" || path.startsWith("/v1/quests/");
+  const chatPath =
+    path === "/v1/conversations" ||
+    path.startsWith("/v1/conversations/") ||
+    path === "/v1/chat/turn" ||
+    path === "/v1/autoprompt" ||
+    path === "/v1/web/search" ||
+    path === "/v1/web/fetch" ||
+    path === "/v1/credits" ||
+    path === "/v1/quests" ||
+    path.startsWith("/v1/quests/") ||
+    path === "/v1/notes" ||
+    path.startsWith("/v1/notes/");
   if (!chatPath) return false;
   const allowed = glmCors(req, res);
   if (!allowed) {
@@ -712,6 +724,51 @@ async function handleWalletChat(req, res, url) {
       }
     } catch (error) {
       json(res, error.status || 503, { error: error.message || "Quests are unavailable." });
+      return true;
+    }
+    json(res, 404, { error: "not found" });
+    return true;
+  }
+  if (path === "/v1/notes" || path.startsWith("/v1/notes/")) {
+    try {
+      if (req.method === "GET" && path === "/v1/notes") {
+        const day = url.searchParams.get("day") || "";
+        if (url.searchParams.get("due") === "1") {
+          json(res, 200, { notes: dueMilesNotes(wallet), day: day || new Date().toISOString().slice(0, 10) });
+          return true;
+        }
+        json(res, 200, { notes: listNotes(wallet, day), day: day || new Date().toISOString().slice(0, 10) });
+        return true;
+      }
+      if (req.method === "POST" && path === "/v1/notes") {
+        const body = await readBody(req, 8000);
+        if (body.replace === true && Array.isArray(body.notes)) {
+          json(res, 200, { notes: replaceDayNotes(wallet, body.day, body.notes), day: String(body.day || "").slice(0, 10) });
+          return true;
+        }
+        json(res, 200, { note: createNote(wallet, body) });
+        return true;
+      }
+      if (path.startsWith("/v1/notes/") && path.length > "/v1/notes/".length) {
+        const noteId = decodeURIComponent(path.slice("/v1/notes/".length));
+        if (req.method === "PATCH" || req.method === "POST") {
+          const body = await readBody(req, 8000);
+          const note = updateNote(wallet, noteId, body);
+          if (!note) {
+            json(res, 404, { error: "That note is not on this wallet." });
+            return true;
+          }
+          json(res, 200, { note });
+          return true;
+        }
+        if (req.method === "DELETE") {
+          const removed = deleteNote(wallet, noteId);
+          json(res, removed ? 200 : 404, removed ? { ok: true } : { error: "That note is not on this wallet." });
+          return true;
+        }
+      }
+    } catch (error) {
+      json(res, error.status || 503, { error: error.message || "Notes are unavailable." });
       return true;
     }
     json(res, 404, { error: "not found" });
@@ -935,7 +992,7 @@ const server = http.createServer(async (req, res) => {
       res.end(page);
       return;
     }
-    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname.startsWith("/v1/palm-id/") || url.pathname === "/v1/stats/users" || url.pathname === "/v1/presence" || url.pathname === "/v1/avatar/watch" || url.pathname === "/v1/avatar/memory") {
+    if (url.pathname === "/v1/glm" || url.pathname === "/v1/credits" || url.pathname === "/v1/conversations" || url.pathname.startsWith("/v1/conversations/") || url.pathname === "/v1/chat/turn" || url.pathname === "/v1/autoprompt" || url.pathname === "/v1/web/search" || url.pathname === "/v1/web/fetch" || url.pathname === "/v1/quests" || url.pathname.startsWith("/v1/quests/") || url.pathname === "/v1/notes" || url.pathname.startsWith("/v1/notes/") || url.pathname.startsWith("/v1/palm-id/") || url.pathname === "/v1/stats/users" || url.pathname === "/v1/presence" || url.pathname === "/v1/avatar/watch" || url.pathname === "/v1/avatar/memory") {
       if (req.method === "OPTIONS") {
         const allowed = glmCors(req, res);
         res.writeHead(allowed ? 204 : 403);
